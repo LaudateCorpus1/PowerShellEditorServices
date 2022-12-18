@@ -42,9 +42,7 @@ namespace Microsoft.PowerShell.EditorServices.Services.Symbols
         /// <returns>true if the Ast represents a PowerShell command with arguments, false otherwise</returns>
         private static bool IsNamedCommandWithArguments(Ast ast)
         {
-            CommandAst commandAst = ast as CommandAst;
-
-            return commandAst != null &&
+            return ast is CommandAst commandAst &&
                 commandAst.InvocationOperator != TokenKind.Dot &&
                 PesterSymbolReference.GetCommandType(commandAst.GetCommandName()).HasValue &&
                 commandAst.CommandElements.Count >= 2;
@@ -69,7 +67,7 @@ namespace Microsoft.PowerShell.EditorServices.Services.Symbols
             }
 
             // Ensure that the last argument of the command is a scriptblock
-            if (!(commandAst.CommandElements[commandAst.CommandElements.Count-1] is ScriptBlockExpressionAst))
+            if (commandAst.CommandElements[commandAst.CommandElements.Count - 1] is not ScriptBlockExpressionAst)
             {
                 return false;
             }
@@ -93,33 +91,35 @@ namespace Microsoft.PowerShell.EditorServices.Services.Symbols
                 return null;
             }
 
-            // Search for a name for the test
-            // If the test has more than one argument for names, we set it to null
             string testName = null;
-            bool alreadySawName = false;
-            for (int i = 1; i < pesterCommandAst.CommandElements.Count; i++)
-            {
-                CommandElementAst currentCommandElement = pesterCommandAst.CommandElements[i];
-
-                // Check for an explicit "-Name" parameter
-                if (currentCommandElement is CommandParameterAst parameterAst)
+            if (PesterSymbolReference.IsPesterTestCommand(commandName.Value)) {
+                // Search for a name for the test
+                // If the test has more than one argument for names, we set it to null
+                bool alreadySawName = false;
+                for (int i = 1; i < pesterCommandAst.CommandElements.Count; i++)
                 {
-                    // Found -Name parameter, move to next element which is the argument for -TestName
-                    i++;
+                    CommandElementAst currentCommandElement = pesterCommandAst.CommandElements[i];
 
+                    // Check for an explicit "-Name" parameter
+                    if (currentCommandElement is CommandParameterAst)
+                    {
+                        // Found -Name parameter, move to next element which is the argument for -TestName
+                        i++;
+
+                        if (!alreadySawName && TryGetTestNameArgument(pesterCommandAst.CommandElements[i], out testName))
+                        {
+                            alreadySawName = true;
+                        }
+
+                        continue;
+                    }
+
+                    // Otherwise, if an argument is given with no parameter, we assume it's the name
+                    // If we've already seen a name, we set the name to null
                     if (!alreadySawName && TryGetTestNameArgument(pesterCommandAst.CommandElements[i], out testName))
                     {
                         alreadySawName = true;
                     }
-
-                    continue;
-                }
-
-                // Otherwise, if an argument is given with no parameter, we assume it's the name
-                // If we've already seen a name, we set the name to null
-                if (!alreadySawName && TryGetTestNameArgument(pesterCommandAst.CommandElements[i], out testName))
-                {
-                    alreadySawName = true;
                 }
             }
 
@@ -142,12 +142,12 @@ namespace Microsoft.PowerShell.EditorServices.Services.Symbols
                 return true;
             }
 
-            return (commandElementAst is ExpandableStringExpressionAst);
+            return commandElementAst is ExpandableStringExpressionAst;
         }
     }
 
     /// <summary>
-    /// Defines command types for Pester test blocks.
+    /// Defines command types for Pester blocks.
     /// </summary>
     internal enum PesterCommandType
     {
@@ -164,7 +164,32 @@ namespace Microsoft.PowerShell.EditorServices.Services.Symbols
         /// <summary>
         /// Identifies an It block.
         /// </summary>
-        It
+        It,
+
+        /// <summary>
+        /// Identifies an BeforeAll block.
+        /// </summary>
+        BeforeAll,
+
+        /// <summary>
+        /// Identifies an BeforeEach block.
+        /// </summary>
+        BeforeEach,
+
+        /// <summary>
+        /// Identifies an AfterAll block.
+        /// </summary>
+        AfterAll,
+
+        /// <summary>
+        /// Identifies an AfterEach block.
+        /// </summary>
+        AfterEach,
+
+        /// <summary>
+        /// Identifies an BeforeDiscovery block.
+        /// </summary>
+        BeforeDiscovery
     }
 
     /// <summary>
@@ -181,17 +206,17 @@ namespace Microsoft.PowerShell.EditorServices.Services.Symbols
                 .Cast<PesterCommandType>()
                 .ToDictionary(pct => pct.ToString(), pct => pct, StringComparer.OrdinalIgnoreCase);
 
-        private static char[] DefinitionTrimChars = new char[] { ' ', '{' };
+        private static readonly char[] DefinitionTrimChars = new char[] { ' ', '{' };
 
         /// <summary>
         /// Gets the name of the test
         /// </summary>
-        public string TestName { get; private set; }
+        public string TestName { get; }
 
         /// <summary>
         /// Gets the test's command type.
         /// </summary>
-        public PesterCommandType Command { get; private set; }
+        public PesterCommandType Command { get; }
 
         internal PesterSymbolReference(
             ScriptFile scriptFile,
@@ -201,23 +226,35 @@ namespace Microsoft.PowerShell.EditorServices.Services.Symbols
             IScriptExtent scriptExtent)
                 : base(
                     SymbolType.Function,
-                    testLine.TrimEnd(DefinitionTrimChars),
+                    testLine.TrimStart().TrimEnd(DefinitionTrimChars),
                     scriptExtent,
                     scriptFile.FilePath,
                     testLine)
         {
-            this.Command = commandType;
-            this.TestName = testName;
+            Command = commandType;
+            TestName = testName;
         }
 
         internal static PesterCommandType? GetCommandType(string commandName)
         {
-            PesterCommandType pesterCommandType;
-            if (commandName == null || !PesterKeywords.TryGetValue(commandName, out pesterCommandType))
+            if (commandName == null || !PesterKeywords.TryGetValue(commandName, out PesterCommandType pesterCommandType))
             {
                 return null;
             }
             return pesterCommandType;
+        }
+
+        /// <summary>
+        /// Checks if the PesterCommandType is a block with executable tests (Describe/Context/It).
+        /// </summary>
+        /// <param name="pesterCommandType">the PesterCommandType representing the Pester command</param>
+        /// <returns>True if command type is a block used to trigger test run. False if setup/teardown/support-block.</returns>
+        internal static bool IsPesterTestCommand(PesterCommandType pesterCommandType)
+        {
+            return pesterCommandType is
+                PesterCommandType.Describe or
+                PesterCommandType.Context or
+                PesterCommandType.It;
         }
     }
 }

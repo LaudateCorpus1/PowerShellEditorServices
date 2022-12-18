@@ -22,9 +22,8 @@ namespace Microsoft.PowerShell.EditorServices.Extensions
         public string Name { get; set; }
     }
 
-
     internal class GetEditorContextRequest
-    {}
+    { }
 
     internal enum EditorCommandResponse
     {
@@ -72,4 +71,3 @@ namespace Microsoft.PowerShell.EditorServices.Extensions
         public int? Timeout { get; set; }
     }
 }
-

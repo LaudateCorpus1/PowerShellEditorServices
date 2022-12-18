@@ -3,16 +3,13 @@
 
 using System;
 using System.Management.Automation;
-using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.Logging;
 using Microsoft.PowerShell.EditorServices.Extensions;
 using Microsoft.PowerShell.EditorServices.VSCode.CustomViews;
-using OmniSharp.Extensions.LanguageServer.Protocol.Server;
 
 namespace Microsoft.PowerShell.EditorServices.VSCode
 {
     ///
-    [Cmdlet(VerbsCommon.New,"VSCodeHtmlContentView")]
+    [Cmdlet(VerbsCommon.New, "VSCodeHtmlContentView")]
     [OutputType(typeof(IHtmlContentView))]
     public class NewVSCodeHtmlContentViewCommand : PSCmdlet
     {
@@ -59,7 +56,8 @@ namespace Microsoft.PowerShell.EditorServices.VSCode
                 .GetAwaiter()
                 .GetResult();
 
-            if (_showInColumn != null) {
+            if (_showInColumn != null)
+            {
                 try
                 {
                     view.Show(_showInColumn.Value).GetAwaiter().GetResult();
@@ -82,7 +80,7 @@ namespace Microsoft.PowerShell.EditorServices.VSCode
     }
 
     ///
-    [Cmdlet(VerbsCommon.Set,"VSCodeHtmlContentView")]
+    [Cmdlet(VerbsCommon.Set, "VSCodeHtmlContentView")]
     public class SetVSCodeHtmlContentViewCommand : PSCmdlet
     {
         ///
@@ -108,10 +106,12 @@ namespace Microsoft.PowerShell.EditorServices.VSCode
         ///
         protected override void BeginProcessing()
         {
-            var htmlContent = new HtmlContent();
-            htmlContent.BodyContent = HtmlBodyContent;
-            htmlContent.JavaScriptPaths = JavaScriptPaths;
-            htmlContent.StyleSheetPaths = StyleSheetPaths;
+            HtmlContent htmlContent = new()
+            {
+                BodyContent = HtmlBodyContent,
+                JavaScriptPaths = JavaScriptPaths,
+                StyleSheetPaths = StyleSheetPaths
+            };
             try
             {
                 HtmlContentView.SetContentAsync(htmlContent).GetAwaiter().GetResult();
@@ -129,7 +129,7 @@ namespace Microsoft.PowerShell.EditorServices.VSCode
     }
 
     ///
-    [Cmdlet(VerbsCommon.Close,"VSCodeHtmlContentView")]
+    [Cmdlet(VerbsCommon.Close, "VSCodeHtmlContentView")]
     public class CloseVSCodeHtmlContentViewCommand : PSCmdlet
     {
         ///
@@ -158,7 +158,7 @@ namespace Microsoft.PowerShell.EditorServices.VSCode
     }
 
     ///
-    [Cmdlet(VerbsCommon.Show,"VSCodeHtmlContentView")]
+    [Cmdlet(VerbsCommon.Show, "VSCodeHtmlContentView")]
     public class ShowVSCodeHtmlContentViewCommand : PSCmdlet
     {
         ///
@@ -193,7 +193,7 @@ namespace Microsoft.PowerShell.EditorServices.VSCode
     }
 
     ///
-    [Cmdlet(VerbsCommunications.Write,"VSCodeHtmlContentView")]
+    [Cmdlet(VerbsCommunications.Write, "VSCodeHtmlContentView")]
     public class WriteVSCodeHtmlContentViewCommand : PSCmdlet
     {
         ///

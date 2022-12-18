@@ -6,7 +6,6 @@ using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
 using Microsoft.PowerShell.EditorServices.Services;
-using Microsoft.PowerShell.EditorServices.Services.PowerShell;
 using Microsoft.PowerShell.EditorServices.Services.Symbols;
 using Microsoft.PowerShell.EditorServices.Services.TextDocument;
 using Microsoft.PowerShell.EditorServices.Utility;
@@ -21,21 +20,18 @@ namespace Microsoft.PowerShell.EditorServices.Handlers
         private readonly ILogger _logger;
         private readonly SymbolsService _symbolsService;
         private readonly WorkspaceService _workspaceService;
-        private readonly IInternalPowerShellExecutionService _executionService;
 
         public PsesSignatureHelpHandler(
             ILoggerFactory factory,
             SymbolsService symbolsService,
-            WorkspaceService workspaceService,
-            IInternalPowerShellExecutionService executionService)
+            WorkspaceService workspaceService)
         {
             _logger = factory.CreateLogger<PsesHoverHandler>();
             _symbolsService = symbolsService;
             _workspaceService = workspaceService;
-            _executionService = executionService;
         }
 
-        protected override SignatureHelpRegistrationOptions CreateRegistrationOptions(SignatureHelpCapability capability, ClientCapabilities clientCapabilities) => new SignatureHelpRegistrationOptions
+        protected override SignatureHelpRegistrationOptions CreateRegistrationOptions(SignatureHelpCapability capability, ClientCapabilities clientCapabilities) => new()
         {
             DocumentSelector = LspUtils.PowerShellDocumentSelector,
             // A sane default of " ". We may be able to include others like "-".
@@ -46,7 +42,7 @@ namespace Microsoft.PowerShell.EditorServices.Handlers
         {
             if (cancellationToken.IsCancellationRequested)
             {
-                _logger.LogDebug("SignatureHelp request canceled for file: {0}", request.TextDocument.Uri);
+                _logger.LogDebug("SignatureHelp request canceled for file: {Uri}", request.TextDocument.Uri);
                 return new SignatureHelp();
             }
 
@@ -63,10 +59,10 @@ namespace Microsoft.PowerShell.EditorServices.Handlers
                 return new SignatureHelp();
             }
 
-            var signatures = new SignatureInformation[parameterSets.Signatures.Length];
+            SignatureInformation[] signatures = new SignatureInformation[parameterSets.Signatures.Length];
             for (int i = 0; i < signatures.Length; i++)
             {
-                var parameters = new List<ParameterInformation>();
+                List<ParameterInformation> parameters = new();
                 foreach (ParameterInfo param in parameterSets.Signatures[i].Parameters)
                 {
                     parameters.Add(CreateParameterInfo(param));

@@ -28,6 +28,11 @@ namespace Microsoft.PowerShell.EditorServices.Utility
         public static string PSEdition { get; } = PowerShellReflectionUtils.PSEdition;
 
         /// <summary>
+        /// Gets the GitCommitId of PowerShell being used.
+        /// </summary>
+        public static string GitCommitId { get; } = PowerShellReflectionUtils.GitCommitId;
+
+        /// <summary>
         /// Gets the string of the PSVersion including prerelease tags if it applies.
         /// </summary>
         public static string PSVersionString { get; } = PowerShellReflectionUtils.PSVersionString;
@@ -61,11 +66,15 @@ namespace Microsoft.PowerShell.EditorServices.Utility
         /// True if we are running on Linux, false otherwise.
         /// </summary>
         public static bool IsLinux { get; } = RuntimeInformation.IsOSPlatform(OSPlatform.Linux);
+
+        /// <summary>
+        /// The .NET Architecture as a string.
+        /// </summary>
+        public static string Architecture { get; } = PowerShellReflectionUtils.GetOSArchitecture();
     }
 
     internal static class PowerShellReflectionUtils
     {
-
         private static readonly Type s_psVersionInfoType = typeof(System.Management.Automation.Runspaces.Runspace).Assembly.GetType("System.Management.Automation.PSVersionInfo");
 
         // This property is a Version type in PowerShell. It's existed since 5.1, but it was only made public in 6.2.
@@ -80,8 +89,12 @@ namespace Microsoft.PowerShell.EditorServices.Utility
         private static readonly PropertyInfo s_psEditionProperty = s_psVersionInfoType
             .GetProperty("PSEdition", BindingFlags.NonPublic | BindingFlags.Public | BindingFlags.Static);
 
+        // This property is a string, existing only in PowerShell Core.
+        private static readonly FieldInfo s_psGitCommitIdProperty = s_psVersionInfoType
+            .GetField("GitCommitId", BindingFlags.NonPublic | BindingFlags.Public | BindingFlags.Static);
+
         /// <summary>
-        /// Get's the Version of PowerShell being used. Note: this will get rid of the SemVer 2.0 suffix because apparently
+        /// Gets the Version of PowerShell being used. NOTE: this will get rid of the SemVer 2.0 suffix because apparently
         /// that property is added as a note property and it is not there when we reflect.
         /// </summary>
         public static Version PSVersion { get; } = s_psVersionProperty.GetValue(null) as Version;
@@ -92,10 +105,36 @@ namespace Microsoft.PowerShell.EditorServices.Utility
         public static string PSEdition { get; } = s_psEditionProperty.GetValue(null) as string;
 
         /// <summary>
+        /// Gets the GitCommitId or at most x.y.z from the PSVersion, making Windows PowerShell conform to SemVer.
+        /// </summary>
+        public static string GitCommitId { get; } = s_psGitCommitIdProperty != null
+            ? s_psGitCommitIdProperty.GetValue(null).ToString()
+            : PSVersion.ToString(3);
+
+        /// <summary>
         /// Gets the stringified version of PowerShell including prerelease tags if it applies.
         /// </summary>
         public static string PSVersionString { get; } = s_psCurrentVersionProperty != null
             ? s_psCurrentVersionProperty.GetValue(null).ToString()
-            : s_psVersionProperty.GetValue(null).ToString();
+            : PSVersion.ToString(3);
+
+        public static string GetOSArchitecture()
+        {
+#if CoreCLR
+            if (Environment.OSVersion.Platform != PlatformID.Win32NT)
+            {
+                return RuntimeInformation.OSArchitecture.ToString();
+            }
+#endif
+            // If on win7 (version 6.1.x), avoid System.Runtime.InteropServices.RuntimeInformation
+            if (Environment.OSVersion.Version < new Version(6, 2))
+            {
+                return Environment.Is64BitProcess
+                    ? "X64"
+                    : "X86";
+            }
+
+            return RuntimeInformation.OSArchitecture.ToString();
+        }
     }
 }

@@ -5,6 +5,7 @@ using System;
 using System.Linq;
 using System.Collections.Generic;
 using System.Management.Automation.Language;
+using System.Text;
 
 namespace Microsoft.PowerShell.EditorServices.Utility
 {
@@ -39,7 +40,7 @@ namespace Microsoft.PowerShell.EditorServices.Utility
         /// <param name="elements">An enumerable object of type T</param>
         /// <param name="comparer">A comparer for ordering elements of type T. The comparer should handle null values.</param>
         /// <returns>An object of type T. If the enumerable is empty or has all null elements, then the method returns null.</returns>
-        public static T MaxElement<T>(this IEnumerable<T> elements, Func<T,T,int> comparer) where T:class
+        public static T MaxElement<T>(this IEnumerable<T> elements, Func<T, T, int> comparer) where T : class
         {
             if (elements == null)
             {
@@ -56,8 +57,8 @@ namespace Microsoft.PowerShell.EditorServices.Utility
                 return null;
             }
 
-            var maxElement = elements.First();
-            foreach(var element in elements.Skip(1))
+            T maxElement = elements.First();
+            foreach (T element in elements.Skip(1))
             {
                 if (element != null && comparer(element, maxElement) > 0)
                 {
@@ -75,10 +76,7 @@ namespace Microsoft.PowerShell.EditorServices.Utility
         /// <param name="elements">An enumerable object of type T</param>
         /// <param name="comparer">A comparer for ordering elements of type T. The comparer should handle null values.</param>
         /// <returns>An object of type T. If the enumerable is empty or has all null elements, then the method returns null.</returns>
-        public static T MinElement<T>(this IEnumerable<T> elements, Func<T, T, int> comparer) where T : class
-        {
-            return MaxElement<T>(elements, (elementX, elementY) => -1 * comparer(elementX, elementY));
-        }
+        public static T MinElement<T>(this IEnumerable<T> elements, Func<T, T, int> comparer) where T : class => MaxElement(elements, (elementX, elementY) => -1 * comparer(elementX, elementY));
 
         /// <summary>
         /// Compare extents with respect to their widths.
@@ -90,7 +88,6 @@ namespace Microsoft.PowerShell.EditorServices.Utility
         /// <returns>0 if extentX and extentY are equal in width. 1 if width of extent X is greater than that of extent Y. Otherwise, -1.</returns>
         public static int ExtentWidthComparer(this IScriptExtent extentX, IScriptExtent extentY)
         {
-
             if (extentX == null && extentY == null)
             {
                 return 0;
@@ -106,8 +103,8 @@ namespace Microsoft.PowerShell.EditorServices.Utility
                 return -1;
             }
 
-            var extentWidthX = extentX.EndOffset - extentX.StartOffset;
-            var extentWidthY = extentY.EndOffset - extentY.StartOffset;
+            int extentWidthX = extentX.EndOffset - extentX.StartOffset;
+            int extentWidthY = extentY.EndOffset - extentY.StartOffset;
             if (extentWidthX > extentWidthY)
             {
                 return 1;
@@ -148,5 +145,21 @@ namespace Microsoft.PowerShell.EditorServices.Utility
 
             return true;
         }
+
+        /// <summary>
+        /// Same as <see cref="StringBuilder.AppendLine()" /> but never CRLF. Use this when building
+        /// formatting for clients that may not render CRLF correctly.
+        /// </summary>
+        /// <param name="self"></param>
+        public static StringBuilder AppendLineLF(this StringBuilder self) => self.Append('\n');
+
+        /// <summary>
+        /// Same as <see cref="StringBuilder.AppendLine(string)" /> but never CRLF. Use this when building
+        /// formatting for clients that may not render CRLF correctly.
+        /// </summary>
+        /// <param name="self"></param>
+        /// <param name="value"></param>
+        public static StringBuilder AppendLineLF(this StringBuilder self, string value)
+            => self.Append(value).Append('\n');
     }
 }

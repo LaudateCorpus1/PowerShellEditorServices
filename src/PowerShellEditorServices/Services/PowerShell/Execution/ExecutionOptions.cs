@@ -15,16 +15,25 @@ namespace Microsoft.PowerShell.EditorServices.Services.PowerShell.Execution
     // Generally the executor will do the right thing though; some options just priority over others.
     public record ExecutionOptions
     {
+        // This determines which underlying queue the task is added to.
         public ExecutionPriority Priority { get; init; } = ExecutionPriority.Normal;
-        public bool MustRunInForeground { get; init; }
-        public bool InterruptCurrentForeground { get; init; }
+        // This implies `ExecutionPriority.Next` because foreground tasks are prepended.
+        public bool RequiresForeground { get; init; }
     }
 
     public record PowerShellExecutionOptions : ExecutionOptions
     {
+        // TODO: Because of the above, this is actually unnecessary.
+        internal static PowerShellExecutionOptions ImmediateInteractive = new()
+        {
+            Priority = ExecutionPriority.Next,
+            RequiresForeground = true,
+        };
+
         public bool WriteOutputToHost { get; init; }
         public bool WriteInputToHost { get; init; }
         public bool ThrowOnError { get; init; } = true;
         public bool AddToHistory { get; init; }
+        internal bool FromRepl { get; init; }
     }
 }

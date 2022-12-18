@@ -3,7 +3,6 @@
 
 using System;
 using System.Collections.Generic;
-using System.IO;
 using System.Threading;
 using System.Threading.Tasks;
 using MediatR;
@@ -11,8 +10,6 @@ using Microsoft.Extensions.Logging;
 using Microsoft.PowerShell.EditorServices.Logging;
 using Microsoft.PowerShell.EditorServices.Services;
 using Microsoft.PowerShell.EditorServices.Services.Configuration;
-using Microsoft.PowerShell.EditorServices.Services.Extension;
-using Microsoft.PowerShell.EditorServices.Services.PowerShell.Host;
 using Newtonsoft.Json.Linq;
 using OmniSharp.Extensions.LanguageServer.Protocol.Models;
 using OmniSharp.Extensions.LanguageServer.Protocol.Server;
@@ -26,30 +23,22 @@ namespace Microsoft.PowerShell.EditorServices.Handlers
         private readonly ILogger _logger;
         private readonly WorkspaceService _workspaceService;
         private readonly ConfigurationService _configurationService;
-        private readonly ExtensionService _extensionService;
-        private readonly PsesInternalHost _psesHost;
         private readonly ILanguageServerFacade _languageServer;
-        private bool _profilesLoaded;
-        private readonly bool _extensionServiceInitialized;
-        private bool _cwdSet;
-
         public PsesConfigurationHandler(
             ILoggerFactory factory,
             WorkspaceService workspaceService,
             AnalysisService analysisService,
             ConfigurationService configurationService,
             ILanguageServerFacade languageServer,
-            ExtensionService extensionService,
-            PsesInternalHost psesHost)
+            SymbolsService symbolsService)
         {
             _logger = factory.CreateLogger<PsesConfigurationHandler>();
             _workspaceService = workspaceService;
             _configurationService = configurationService;
             _languageServer = languageServer;
-            _extensionService = extensionService;
-            _psesHost = psesHost;
 
             ConfigurationUpdated += analysisService.OnConfigurationUpdated;
+            ConfigurationUpdated += symbolsService.OnConfigurationUpdated;
         }
 
         public override async Task<Unit> Handle(DidChangeConfigurationParams request, CancellationToken cancellationToken)
@@ -64,73 +53,13 @@ namespace Microsoft.PowerShell.EditorServices.Handlers
 
             SendFeatureChangesTelemetry(incomingSettings);
 
-            bool profileLoadingPreviouslyEnabled = _configurationService.CurrentSettings.EnableProfileLoading;
-            bool oldScriptAnalysisEnabled =
-                _configurationService.CurrentSettings.ScriptAnalysis.Enable ?? false;
-            string oldScriptAnalysisSettingsPath =
-                _configurationService.CurrentSettings.ScriptAnalysis?.SettingsPath;
+            bool oldScriptAnalysisEnabled = _configurationService.CurrentSettings.ScriptAnalysis.Enable;
+            string oldScriptAnalysisSettingsPath = _configurationService.CurrentSettings.ScriptAnalysis?.SettingsPath;
 
             _configurationService.CurrentSettings.Update(
                 incomingSettings.Powershell,
                 _workspaceService.WorkspacePath,
                 _logger);
-
-            // We need to load the profiles if:
-            // - Profile loading is configured, AND
-            //   - Profiles haven't been loaded before, OR
-            //   - The profile loading configuration just changed
-            bool loadProfiles = _configurationService.CurrentSettings.EnableProfileLoading
-                && (!_profilesLoaded || !profileLoadingPreviouslyEnabled);
-
-            if (!_psesHost.IsRunning)
-            {
-                _logger.LogTrace("Starting command loop");
-
-                if (loadProfiles)
-                {
-                    _logger.LogTrace("Loading profiles...");
-                }
-
-                await _psesHost.TryStartAsync(new HostStartOptions { LoadProfiles = loadProfiles }, CancellationToken.None).ConfigureAwait(false);
-
-                if (loadProfiles)
-                {
-                    _profilesLoaded = true;
-                    _logger.LogTrace("Loaded!");
-                }
-            }
-
-            // TODO: Load profiles when the host is already running
-            if (!_cwdSet)
-            {
-                if (!string.IsNullOrEmpty(_configurationService.CurrentSettings.Cwd)
-                    && Directory.Exists(_configurationService.CurrentSettings.Cwd))
-                {
-                    _logger.LogTrace($"Setting CWD (from config) to {_configurationService.CurrentSettings.Cwd}");
-                    await _psesHost.SetInitialWorkingDirectoryAsync(
-                        _configurationService.CurrentSettings.Cwd,
-                        CancellationToken.None).ConfigureAwait(false);
-                }
-                else if (_workspaceService.WorkspacePath is not null
-                    && Directory.Exists(_workspaceService.WorkspacePath))
-                {
-                    _logger.LogTrace($"Setting CWD (from workspace) to {_workspaceService.WorkspacePath}");
-                    await _psesHost.SetInitialWorkingDirectoryAsync(
-                        _workspaceService.WorkspacePath,
-                        CancellationToken.None).ConfigureAwait(false);
-                }
-                else
-                {
-                    _logger.LogTrace("Tried to set CWD but in bad state");
-                }
-
-                _cwdSet = true;
-            }
-
-            if (!_extensionServiceInitialized)
-            {
-                await _extensionService.InitializeAsync().ConfigureAwait(false);
-            }
 
             // Run any events subscribed to configuration updates
             _logger.LogTrace("Running configuration update event handlers");
@@ -190,10 +119,10 @@ namespace Microsoft.PowerShell.EditorServices.Handlers
 
             Dictionary<string, bool> configChanges = new();
             // Send telemetry if the user opted-out of ScriptAnalysis
-            if (incomingSettings.Powershell.ScriptAnalysis.Enable == false &&
+            if (!incomingSettings.Powershell.ScriptAnalysis.Enable &&
                 _configurationService.CurrentSettings.ScriptAnalysis.Enable != incomingSettings.Powershell.ScriptAnalysis.Enable)
             {
-                configChanges["ScriptAnalysis"] = incomingSettings.Powershell.ScriptAnalysis.Enable ?? false;
+                configChanges["ScriptAnalysis"] = incomingSettings.Powershell.ScriptAnalysis.Enable;
             }
 
             // Send telemetry if the user opted-out of CodeFolding
@@ -201,13 +130,6 @@ namespace Microsoft.PowerShell.EditorServices.Handlers
                 _configurationService.CurrentSettings.CodeFolding.Enable != incomingSettings.Powershell.CodeFolding.Enable)
             {
                 configChanges["CodeFolding"] = incomingSettings.Powershell.CodeFolding.Enable;
-            }
-
-            // Send telemetry if the user opted-out of the prompt to update PackageManagement
-            if (!incomingSettings.Powershell.PromptToUpdatePackageManagement &&
-                _configurationService.CurrentSettings.PromptToUpdatePackageManagement != incomingSettings.Powershell.PromptToUpdatePackageManagement)
-            {
-                configChanges["PromptToUpdatePackageManagement"] = incomingSettings.Powershell.PromptToUpdatePackageManagement;
             }
 
             // Send telemetry if the user opted-out of Profile loading

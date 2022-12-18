@@ -34,7 +34,7 @@ namespace Microsoft.PowerShell.EditorServices.Services.Template
         /// <summary>
         /// Creates a new instance of the TemplateService class.
         /// </summary>
-        /// <param name="powerShellContext">The PowerShellContext to use for this service.</param>
+        /// <param name="executionService">The PowerShellContext to use for this service.</param>
         /// <param name="factory">An ILoggerFactory implementation used for writing log messages.</param>
         public TemplateService(IInternalPowerShellExecutionService executionService, ILoggerFactory factory)
         {
@@ -52,9 +52,9 @@ namespace Microsoft.PowerShell.EditorServices.Services.Template
         /// <returns>A Task that can be awaited until the check is complete.  The result will be true if Plaster is installed.</returns>
         public async Task<bool> ImportPlasterIfInstalledAsync()
         {
-            if (!this.isPlasterInstalled.HasValue)
+            if (!isPlasterInstalled.HasValue)
             {
-                PSCommand psCommand = new PSCommand();
+                PSCommand psCommand = new();
 
                 psCommand
                     .AddCommand("Get-Module")
@@ -70,21 +70,21 @@ namespace Microsoft.PowerShell.EditorServices.Services.Template
                     .AddCommand("Select-Object")
                     .AddParameter("First", 1);
 
-                this._logger.LogTrace("Checking if Plaster is installed...");
+                _logger.LogTrace("Checking if Plaster is installed...");
 
-                PSObject moduleObject = (await _executionService.ExecutePSCommandAsync<PSObject>(psCommand, CancellationToken.None).ConfigureAwait(false)).First();
+                PSObject moduleObject = (await _executionService.ExecutePSCommandAsync<PSObject>(psCommand, CancellationToken.None).ConfigureAwait(false))[0];
 
-                this.isPlasterInstalled = moduleObject != null;
+                isPlasterInstalled = moduleObject != null;
                 string installedQualifier =
-                    this.isPlasterInstalled.Value
+                    isPlasterInstalled.Value
                         ? string.Empty : "not ";
 
-                this._logger.LogTrace($"Plaster is {installedQualifier}installed!");
+                _logger.LogTrace($"Plaster is {installedQualifier}installed!");
 
                 // Attempt to load plaster
-                if (this.isPlasterInstalled.Value && this.isPlasterLoaded == false)
+                if (isPlasterInstalled.Value && !isPlasterLoaded)
                 {
-                    this._logger.LogTrace("Loading Plaster...");
+                    _logger.LogTrace("Loading Plaster...");
 
                     psCommand = new PSCommand();
                     psCommand
@@ -94,16 +94,16 @@ namespace Microsoft.PowerShell.EditorServices.Services.Template
 
                     IReadOnlyList<PSModuleInfo> importResult = await _executionService.ExecutePSCommandAsync<PSModuleInfo>(psCommand, CancellationToken.None).ConfigureAwait(false);
 
-                    this.isPlasterLoaded = importResult.Any();
+                    isPlasterLoaded = importResult.Count > 0;
                     string loadedQualifier =
-                        this.isPlasterInstalled.Value
+                        isPlasterInstalled.Value
                             ? "was" : "could not be";
 
-                    this._logger.LogTrace($"Plaster {loadedQualifier} loaded successfully!");
+                    _logger.LogTrace($"Plaster {loadedQualifier} loaded successfully!");
                 }
             }
 
-            return this.isPlasterInstalled.Value;
+            return isPlasterInstalled.Value;
         }
 
         /// <summary>
@@ -118,12 +118,12 @@ namespace Microsoft.PowerShell.EditorServices.Services.Template
         public async Task<TemplateDetails[]> GetAvailableTemplatesAsync(
             bool includeInstalledModules)
         {
-            if (!this.isPlasterLoaded)
+            if (!isPlasterLoaded)
             {
                 throw new InvalidOperationException("Plaster is not loaded, templates cannot be accessed.");
             }
 
-            PSCommand psCommand = new PSCommand();
+            PSCommand psCommand = new();
             psCommand.AddCommand("Get-PlasterTemplate");
 
             if (includeInstalledModules)
@@ -135,7 +135,7 @@ namespace Microsoft.PowerShell.EditorServices.Services.Template
                 psCommand,
                 CancellationToken.None).ConfigureAwait(false);
 
-            this._logger.LogTrace($"Found {templateObjects.Count()} Plaster templates");
+            _logger.LogTrace($"Found {templateObjects.Count} Plaster templates");
 
             return
                 templateObjects
@@ -155,18 +155,24 @@ namespace Microsoft.PowerShell.EditorServices.Services.Template
             string templatePath,
             string destinationPath)
         {
-            this._logger.LogTrace(
+            _logger.LogTrace(
                 $"Invoking Plaster...\n\n    TemplatePath: {templatePath}\n    DestinationPath: {destinationPath}");
 
-            PSCommand command = new PSCommand();
-            command.AddCommand("Invoke-Plaster");
-            command.AddParameter("TemplatePath", templatePath);
-            command.AddParameter("DestinationPath", destinationPath);
+            PSCommand command = new PSCommand()
+                .AddCommand("Invoke-Plaster")
+                .AddParameter("TemplatePath", templatePath)
+                .AddParameter("DestinationPath", destinationPath);
 
+            // This command is interactive so it requires the foreground.
             await _executionService.ExecutePSCommandAsync(
                 command,
                 CancellationToken.None,
-                new PowerShellExecutionOptions { WriteOutputToHost = true, InterruptCurrentForeground = true, ThrowOnError = false }).ConfigureAwait(false);
+                new PowerShellExecutionOptions
+                {
+                    RequiresForeground = true,
+                    WriteOutputToHost = true,
+                    ThrowOnError = false
+                }).ConfigureAwait(false);
 
             // If any errors were written out, creation was not successful
             return true;

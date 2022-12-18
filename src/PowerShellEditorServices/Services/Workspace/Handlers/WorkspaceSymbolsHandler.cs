@@ -23,17 +23,18 @@ namespace Microsoft.PowerShell.EditorServices.Handlers
         private readonly SymbolsService _symbolsService;
         private readonly WorkspaceService _workspaceService;
 
-        public PsesWorkspaceSymbolsHandler(ILoggerFactory loggerFactory, SymbolsService symbols, WorkspaceService workspace) {
+        public PsesWorkspaceSymbolsHandler(ILoggerFactory loggerFactory, SymbolsService symbols, WorkspaceService workspace)
+        {
             _logger = loggerFactory.CreateLogger<PsesWorkspaceSymbolsHandler>();
             _symbolsService = symbols;
             _workspaceService = workspace;
         }
 
-        protected override WorkspaceSymbolRegistrationOptions CreateRegistrationOptions(WorkspaceSymbolCapability capability, ClientCapabilities clientCapabilities) => new WorkspaceSymbolRegistrationOptions { };
+        protected override WorkspaceSymbolRegistrationOptions CreateRegistrationOptions(WorkspaceSymbolCapability capability, ClientCapabilities clientCapabilities) => new() { };
 
-        public override Task<Container<SymbolInformation>> Handle(WorkspaceSymbolParams request, CancellationToken cancellationToken)
+        public override async Task<Container<SymbolInformation>> Handle(WorkspaceSymbolParams request, CancellationToken cancellationToken)
         {
-            var symbols = new List<SymbolInformation>();
+            List<SymbolInformation> symbols = new();
 
             foreach (ScriptFile scriptFile in _workspaceService.GetOpenedFiles())
             {
@@ -46,12 +47,23 @@ namespace Microsoft.PowerShell.EditorServices.Handlers
 
                 foreach (SymbolReference foundOccurrence in foundSymbols)
                 {
+                    // This async method is pretty dense with synchronous code
+                    // so it's helpful to add some yields.
+                    await Task.Yield();
+                    cancellationToken.ThrowIfCancellationRequested();
                     if (!IsQueryMatch(request.Query, foundOccurrence.SymbolName))
                     {
                         continue;
                     }
 
-                    var location = new Location
+                    // Exclude Pester setup/teardown symbols as they're unnamed
+                    if (foundOccurrence is PesterSymbolReference pesterSymbol &&
+                        !PesterSymbolReference.IsPesterTestCommand(pesterSymbol.Command))
+                    {
+                        continue;
+                    }
+
+                    Location location = new()
                     {
                         Uri = DocumentUri.From(foundOccurrence.FilePath),
                         Range = GetRangeFromScriptRegion(foundOccurrence.ScriptRegion)
@@ -67,16 +79,12 @@ namespace Microsoft.PowerShell.EditorServices.Handlers
                 }
             }
             _logger.LogWarning("Logging in a handler works now.");
-
-            return Task.FromResult(new Container<SymbolInformation>(symbols));
+            return new Container<SymbolInformation>(symbols);
         }
 
         #region private Methods
 
-        private static bool IsQueryMatch(string query, string symbolName)
-        {
-            return symbolName.IndexOf(query, StringComparison.OrdinalIgnoreCase) >= 0;
-        }
+        private static bool IsQueryMatch(string query, string symbolName) => symbolName.IndexOf(query, StringComparison.OrdinalIgnoreCase) >= 0;
 
         private static Range GetRangeFromScriptRegion(ScriptRegion scriptRegion)
         {
@@ -99,9 +107,9 @@ namespace Microsoft.PowerShell.EditorServices.Handlers
         {
             string name = symbolReference.SymbolName;
 
-            if (symbolReference.SymbolType == SymbolType.Configuration ||
-                symbolReference.SymbolType == SymbolType.Function ||
-                symbolReference.SymbolType == SymbolType.Workflow)
+            if (symbolReference.SymbolType is SymbolType.Configuration or
+                SymbolType.Function or
+                SymbolType.Workflow)
             {
                 name += " { }";
             }

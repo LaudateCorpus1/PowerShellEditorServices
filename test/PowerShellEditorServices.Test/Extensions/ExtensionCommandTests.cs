@@ -13,10 +13,11 @@ using Microsoft.PowerShell.EditorServices.Extensions.Services;
 using Microsoft.PowerShell.EditorServices.Services.Extension;
 using Microsoft.PowerShell.EditorServices.Services.PowerShell.Host;
 using Microsoft.PowerShell.EditorServices.Services.TextDocument;
+using Microsoft.PowerShell.EditorServices.Test;
 using Microsoft.PowerShell.EditorServices.Test.Shared;
 using Xunit;
 
-namespace Microsoft.PowerShell.EditorServices.Test.Extensions
+namespace PowerShellEditorServices.Test.Extensions
 {
     [Trait("Category", "Extensions")]
     public class ExtensionCommandTests : IDisposable
@@ -33,13 +34,17 @@ namespace Microsoft.PowerShell.EditorServices.Test.Extensions
                 serviceProvider: null,
                 editorOperations: null,
                 executionService: psesHost);
+#pragma warning disable VSTHRD002
             extensionService.InitializeAsync().Wait();
+#pragma warning restore VSTHRD002
             extensionCommandService = new(extensionService);
         }
 
         public void Dispose()
         {
+#pragma warning disable VSTHRD002
             psesHost.StopAsync().Wait();
+#pragma warning restore VSTHRD002
             GC.SuppressFinalize(this);
         }
 
@@ -47,15 +52,15 @@ namespace Microsoft.PowerShell.EditorServices.Test.Extensions
         public async Task CanRegisterAndInvokeCommandWithCmdletName()
         {
             string filePath = TestUtilities.NormalizePath("C:\\Temp\\Test.ps1");
-            var currentFile = new ScriptFile(new Uri(filePath), "This is a test file", new Version("7.0"));
-            var editorContext = new EditorContext(
+            ScriptFile currentFile = new(new Uri(filePath), "This is a test file", new Version("7.0"));
+            EditorContext editorContext = new(
                 editorOperations: null,
                 currentFile,
                 new BufferPosition(line: 1, column: 1),
                 BufferRange.None);
 
             EditorCommand commandAdded = null;
-            extensionCommandService.CommandAdded += (object _, EditorCommand command) => commandAdded = command;
+            extensionCommandService.CommandAdded += (_, command) => commandAdded = command;
 
             const string commandName = "test.function";
             const string commandDisplayName = "Function extension";
@@ -67,8 +72,8 @@ namespace Microsoft.PowerShell.EditorServices.Test.Extensions
                 CancellationToken.None).ConfigureAwait(true);
 
             Assert.NotNull(commandAdded);
-            Assert.Equal(commandAdded.Name, commandName);
-            Assert.Equal(commandAdded.DisplayName, commandDisplayName);
+            Assert.Equal(commandName, commandAdded.Name);
+            Assert.Equal(commandDisplayName, commandAdded.DisplayName);
 
             // Invoke the command
             await extensionCommandService.InvokeCommandAsync(commandName, editorContext).ConfigureAwait(true);
@@ -83,15 +88,15 @@ namespace Microsoft.PowerShell.EditorServices.Test.Extensions
         public async Task CanRegisterAndInvokeCommandWithScriptBlock()
         {
             string filePath = TestUtilities.NormalizePath("C:\\Temp\\Test.ps1");
-            var currentFile = new ScriptFile(new Uri(filePath), "This is a test file", new Version("7.0"));
-            var editorContext = new EditorContext(
+            ScriptFile currentFile = new(new Uri(filePath), "This is a test file", new Version("7.0"));
+            EditorContext editorContext = new(
                 editorOperations: null,
                 currentFile,
                 new BufferPosition(line: 1, column: 1),
                 BufferRange.None);
 
             EditorCommand commandAdded = null;
-            extensionCommandService.CommandAdded += (object _, EditorCommand command) => commandAdded = command;
+            extensionCommandService.CommandAdded += (_, command) => commandAdded = command;
 
             const string commandName = "test.scriptblock";
             const string commandDisplayName = "ScriptBlock extension";
@@ -108,7 +113,8 @@ namespace Microsoft.PowerShell.EditorServices.Test.Extensions
             Assert.Equal(commandName, commandAdded.Name);
             Assert.Equal(commandDisplayName, commandAdded.DisplayName);
 
-            // Invoke the command
+            // Invoke the command.
+            // TODO: What task was this cancelling?
             await extensionCommandService.InvokeCommandAsync("test.scriptblock", editorContext).ConfigureAwait(true);
 
             // Assert the expected value
@@ -121,7 +127,7 @@ namespace Microsoft.PowerShell.EditorServices.Test.Extensions
         public async Task CanUpdateRegisteredCommand()
         {
             EditorCommand updatedCommand = null;
-            extensionCommandService.CommandUpdated += (object _, EditorCommand command) => updatedCommand = command;
+            extensionCommandService.CommandUpdated += (_, command) => updatedCommand = command;
 
             const string commandName = "test.function";
             const string commandDisplayName = "Updated function extension";
@@ -144,8 +150,8 @@ namespace Microsoft.PowerShell.EditorServices.Test.Extensions
         public async Task CanUnregisterCommand()
         {
             string filePath = TestUtilities.NormalizePath("C:\\Temp\\Test.ps1");
-            var currentFile = new ScriptFile(new Uri(filePath), "This is a test file", new Version("7.0"));
-            var editorContext = new EditorContext(
+            ScriptFile currentFile = new(new Uri(filePath), "This is a test file", new Version("7.0"));
+            EditorContext editorContext = new(
                 editorOperations: null,
                 currentFile,
                 new BufferPosition(line: 1, column: 1),
@@ -155,7 +161,7 @@ namespace Microsoft.PowerShell.EditorServices.Test.Extensions
             const string commandDisplayName = "ScriptBlock extension";
 
             EditorCommand removedCommand = null;
-            extensionCommandService.CommandRemoved += (object _, EditorCommand command) => removedCommand = command;
+            extensionCommandService.CommandRemoved += (_, command) => removedCommand = command;
 
             // Add the command and wait for the add event
             await psesHost.ExecutePSCommandAsync(
@@ -178,6 +184,20 @@ namespace Microsoft.PowerShell.EditorServices.Test.Extensions
             // Ensure that the command has been unregistered
             await Assert.ThrowsAsync<KeyNotFoundException>(
                 () => extensionCommandService.InvokeCommandAsync("test.scriptblock", editorContext)).ConfigureAwait(true);
+        }
+
+        [Fact]
+        public async Task CannotRemovePSEditorVariable()
+        {
+            ActionPreferenceStopException exception = await Assert.ThrowsAsync<ActionPreferenceStopException>(
+                () => psesHost.ExecutePSCommandAsync<string>(
+                    new PSCommand().AddScript("Remove-Variable psEditor -ErrorAction Stop"),
+                    CancellationToken.None)
+            ).ConfigureAwait(true);
+
+            Assert.Equal(
+                "The running command stopped because the preference variable \"ErrorActionPreference\" or common parameter is set to Stop: Cannot remove variable psEditor because it is constant or read-only. If the variable is read-only, try the operation again specifying the Force option.",
+                exception.Message);
         }
     }
 }

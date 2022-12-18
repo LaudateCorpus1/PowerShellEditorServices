@@ -154,15 +154,9 @@ namespace Microsoft.PowerShell.EditorServices.Services.DebugAdapter
             };
         }
 
-        public static List<Breakpoint> GetBreakpoints(Debugger debugger, int? runspaceId = null)
-        {
-            return GetBreakpointsDelegate(debugger, runspaceId);
-        }
+        public static List<Breakpoint> GetBreakpoints(Debugger debugger, int? runspaceId = null) => GetBreakpointsDelegate(debugger, runspaceId);
 
-        public static bool RemoveBreakpoint(Debugger debugger, Breakpoint breakpoint, int? runspaceId = null)
-        {
-            return RemoveBreakpointDelegate(debugger, breakpoint, runspaceId);
-        }
+        public static bool RemoveBreakpoint(Debugger debugger, Breakpoint breakpoint, int? runspaceId = null) => RemoveBreakpointDelegate(debugger, breakpoint, runspaceId);
 
         /// <summary>
         /// Inspects the condition, putting in the appropriate scriptblock template
@@ -173,6 +167,7 @@ namespace Microsoft.PowerShell.EditorServices.Services.DebugAdapter
         /// <param name="condition">The expression that needs to be true for the breakpoint to be triggered.</param>
         /// <param name="hitCondition">The amount of times this line should be hit til the breakpoint is triggered.</param>
         /// <param name="logMessage">The log message to write instead of calling 'break'. In VS Code, this is called a 'logPoint'.</param>
+        /// <param name="errorMessage">The error message we might return.</param>
         /// <returns>ScriptBlock</returns>
         public static ScriptBlock GetBreakpointActionScriptBlock(string condition, string hitCondition, string logMessage, out string errorMessage)
         {
@@ -183,7 +178,7 @@ namespace Microsoft.PowerShell.EditorServices.Services.DebugAdapter
                 StringBuilder builder = new(
                     string.IsNullOrEmpty(logMessage)
                         ? "break"
-                        : $"Microsoft.PowerShell.Utility\\Write-Host \"{logMessage.Replace("\"","`\"")}\"");
+                        : $"Microsoft.PowerShell.Utility\\Write-Host \"{logMessage.Replace("\"", "`\"")}\"");
 
                 // If HitCondition specified, parse and verify it.
                 if (!string.IsNullOrWhiteSpace(hitCondition))
@@ -224,7 +219,7 @@ namespace Microsoft.PowerShell.EditorServices.Services.DebugAdapter
                     // Check for "advanced" condition syntax i.e. if the user has specified
                     // a "break" or  "continue" statement anywhere in their scriptblock,
                     // pass their scriptblock through to the Action parameter as-is.
-                    if (parsed.Ast.Find(ast => ast is BreakStatementAst || ast is ContinueStatementAst, true) is not null)
+                    if (parsed.Ast.Find(ast => ast is BreakStatementAst or ContinueStatementAst, true) is not null)
                     {
                         return parsed;
                     }
@@ -319,10 +314,7 @@ namespace Microsoft.PowerShell.EditorServices.Services.DebugAdapter
             return FormatInvalidBreakpointConditionMessage(condition, parseException.Message);
         }
 
-        private static string FormatInvalidBreakpointConditionMessage(string condition, string message)
-        {
-            return $"'{condition}' is not a valid PowerShell expression. {message}";
-        }
+        private static string FormatInvalidBreakpointConditionMessage(string condition, string message) => $"'{condition}' is not a valid PowerShell expression. {message}";
 
         #endregion
     }

@@ -1,4 +1,4 @@
-﻿// Copyright (c) Microsoft Corporation.
+// Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
 using System.Management.Automation;
@@ -25,9 +25,11 @@ namespace Microsoft.PowerShell.EditorServices.Handlers
         // TODO: We currently set `WriteInputToHost` as true, which writes our debugged commands'
         // `GetInvocationText` and that reveals some obscure implementation details we should
         // instead hide from the user with pretty strings (or perhaps not write out at all).
+        //
+        // This API is mostly used for F5 execution so it requires the foreground.
         private static readonly PowerShellExecutionOptions s_debuggerExecutionOptions = new()
         {
-            MustRunInForeground = true,
+            RequiresForeground = true,
             WriteInputToHost = true,
             WriteOutputToHost = true,
             ThrowOnError = false,
@@ -100,13 +102,22 @@ namespace Microsoft.PowerShell.EditorServices.Handlers
             return Task.FromResult(new ConfigurationDoneResponse());
         }
 
-        private async Task LaunchScriptAsync(string scriptToLaunch)
+        // NOTE: We test this function in `DebugServiceTests` so it both needs to be internal, and
+        // use conditional-access on `_debugStateService` and `_debugAdapterServer` as its not set
+        // by tests.
+        internal async Task LaunchScriptAsync(string scriptToLaunch)
         {
             PSCommand command;
-            if (ScriptFile.IsUntitledPath(scriptToLaunch))
+            if (System.IO.File.Exists(scriptToLaunch))
             {
-                ScriptFile untitledScript = _workspaceService.GetFile(scriptToLaunch);
-                if (BreakpointApiUtils.SupportsBreakpointApis(_runspaceContext.CurrentRunspace))
+                // For a saved file we just execute its path (after escaping it).
+                command = PSCommandHelpers.BuildDotSourceCommandWithArguments(
+                    PSCommandHelpers.EscapeScriptFilePath(scriptToLaunch), _debugStateService?.Arguments);
+            }
+            else // It's a URI to an untitled script, or a raw script.
+            {
+                bool isScriptFile = _workspaceService.TryGetFile(scriptToLaunch, out ScriptFile untitledScript);
+                if (isScriptFile && BreakpointApiUtils.SupportsBreakpointApis(_runspaceContext.CurrentRunspace))
                 {
                     // Parse untitled files with their `Untitled:` URI as the filename which will
                     // cache the URI and contents within the PowerShell parser. By doing this, we
@@ -127,29 +138,29 @@ namespace Microsoft.PowerShell.EditorServices.Handlers
                     // on each invocation, so passing the user's arguments directly in the initial
                     // `AddScript` surprisingly works.
                     command = PSCommandHelpers
-                        .BuildDotSourceCommandWithArguments("$args[0]", _debugStateService.Arguments)
+                        .BuildDotSourceCommandWithArguments("$args[0]", _debugStateService?.Arguments)
                         .AddArgument(ast.GetScriptBlock());
                 }
                 else
                 {
                     // Without the new APIs we can only execute the untitled script's contents.
-                    // Command breakpoints and `Wait-Debugger` will work.
+                    // Command breakpoints and `Wait-Debugger` will work. We must wrap the script
+                    // with newlines so that any included comments don't break the command.
                     command = PSCommandHelpers.BuildDotSourceCommandWithArguments(
-                        string.Concat("{ ", untitledScript.Contents, " }"), _debugStateService.Arguments);
+                        string.Concat(
+                            "{" + System.Environment.NewLine,
+                            isScriptFile ? untitledScript.Contents : scriptToLaunch,
+                            System.Environment.NewLine + "}"),
+                            _debugStateService?.Arguments);
                 }
-            }
-            else
-            {
-                // For a saved file we just execute its path (after escaping it).
-                command = PSCommandHelpers.BuildDotSourceCommandWithArguments(
-                    string.Concat('"', scriptToLaunch, '"'), _debugStateService.Arguments);
             }
 
             await _executionService.ExecutePSCommandAsync(
                 command,
                 CancellationToken.None,
                 s_debuggerExecutionOptions).ConfigureAwait(false);
-            _debugAdapterServer.SendNotification(EventNames.Terminated);
+
+            _debugAdapterServer?.SendNotification(EventNames.Terminated);
         }
     }
 }

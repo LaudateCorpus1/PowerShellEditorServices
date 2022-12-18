@@ -13,18 +13,18 @@ namespace Microsoft.PowerShell.EditorServices.VSCode.CustomViews
 
         public Guid Id { get; private set; }
 
-        public string Title { get; private set; }
+        public string Title { get; }
 
-        protected CustomViewType ViewType { get; private set; }
+        protected CustomViewType ViewType { get; }
 
         public CustomViewBase(
             string viewTitle,
             CustomViewType viewType,
             ILanguageServerService languageServer)
         {
-            this.Id = Guid.NewGuid();
-            this.Title = viewTitle;
-            this.ViewType = viewType;
+            Id = Guid.NewGuid();
+            Title = viewTitle;
+            ViewType = viewType;
             this.languageServer = languageServer;
         }
 
@@ -33,9 +33,9 @@ namespace Microsoft.PowerShell.EditorServices.VSCode.CustomViews
                 NewCustomViewRequest.Method,
                 new NewCustomViewRequest
                 {
-                    Id = this.Id,
-                    Title = this.Title,
-                    ViewType = this.ViewType,
+                    Id = Id,
+                    Title = Title,
+                    ViewType = ViewType,
                 });
 
         public Task Show(ViewColumn viewColumn) =>
@@ -43,7 +43,7 @@ namespace Microsoft.PowerShell.EditorServices.VSCode.CustomViews
                 ShowCustomViewRequest.Method,
                 new ShowCustomViewRequest
                 {
-                    Id = this.Id,
+                    Id = Id,
                     ViewColumn = viewColumn
                 });
 
@@ -52,7 +52,7 @@ namespace Microsoft.PowerShell.EditorServices.VSCode.CustomViews
                 CloseCustomViewRequest.Method,
                 new CloseCustomViewRequest
                 {
-                    Id = this.Id,
+                    Id = Id,
                 });
     }
 }

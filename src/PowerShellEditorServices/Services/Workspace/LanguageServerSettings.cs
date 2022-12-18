@@ -17,12 +17,13 @@ namespace Microsoft.PowerShell.EditorServices.Services.Configuration
     {
         private readonly object updateLock = new();
         public bool EnableProfileLoading { get; set; }
-        public bool PromptToUpdatePackageManagement { get; set; } = true;
         public ScriptAnalysisSettings ScriptAnalysis { get; set; }
         public CodeFormattingSettings CodeFormatting { get; set; }
         public CodeFoldingSettings CodeFolding { get; set; }
         public PesterSettings Pester { get; set; }
         public string Cwd { get; set; }
+        public bool EnableReferencesCodeLens { get; set; } = true;
+        public bool AnalyzeOpenDocumentsOnly { get; set; }
 
         public LanguageServerSettings()
         {
@@ -42,12 +43,13 @@ namespace Microsoft.PowerShell.EditorServices.Services.Configuration
                 lock (updateLock)
                 {
                     EnableProfileLoading = settings.EnableProfileLoading;
-                    PromptToUpdatePackageManagement = settings.PromptToUpdatePackageManagement;
                     ScriptAnalysis.Update(settings.ScriptAnalysis, workspaceRootPath, logger);
                     CodeFormatting = new CodeFormattingSettings(settings.CodeFormatting);
                     CodeFolding.Update(settings.CodeFolding, logger);
                     Pester.Update(settings.Pester, logger);
                     Cwd = settings.Cwd;
+                    EnableReferencesCodeLens = settings.EnableReferencesCodeLens;
+                    AnalyzeOpenDocumentsOnly = settings.AnalyzeOpenDocumentsOnly;
                 }
             }
         }
@@ -56,9 +58,9 @@ namespace Microsoft.PowerShell.EditorServices.Services.Configuration
     internal class ScriptAnalysisSettings
     {
         private readonly object updateLock = new();
-        public bool? Enable { get; set; }
+        public bool Enable { get; set; }
         public string SettingsPath { get; set; }
-        public ScriptAnalysisSettings() { Enable = true; }
+        public ScriptAnalysisSettings() => Enable = true;
 
         public void Update(
             ScriptAnalysisSettings settings,
@@ -88,7 +90,7 @@ namespace Microsoft.PowerShell.EditorServices.Services.Configuration
                                 // In this case we should just log an error and let
                                 // the specified settings path go through even though
                                 // it will fail to load.
-                                logger.LogError( "Could not resolve Script Analyzer settings path due to null or empty workspaceRootPath.");
+                                logger.LogError("Could not resolve Script Analyzer settings path due to null or empty workspaceRootPath.");
                             }
                             else
                             {
@@ -189,6 +191,7 @@ namespace Microsoft.PowerShell.EditorServices.Services.Configuration
 
         public bool AddWhitespaceAroundPipe { get; set; }
         public bool AutoCorrectAliases { get; set; }
+        public bool AvoidSemicolonsAsLineTerminators { get; set; }
         public bool UseConstantStrings { get; set; }
         public CodeFormattingPreset Preset { get; set; }
         public bool OpenBraceOnSameLine { get; set; }
@@ -211,6 +214,7 @@ namespace Microsoft.PowerShell.EditorServices.Services.Configuration
         /// </summary>
         /// <param name="tabSize">The tab size in the number spaces.</param>
         /// <param name="insertSpaces">If true, insert spaces otherwise insert tabs for indentation.</param>
+        /// <param name="logger">The logger instance.</param>
         public Hashtable GetPSSASettingsHashtable(
             int tabSize,
             bool insertSpaces,
@@ -240,13 +244,9 @@ namespace Microsoft.PowerShell.EditorServices.Services.Configuration
                     openBraceSettings["NewLineAfter"] = true;
                     closeBraceSettings["NewLineAfter"] = true;
                     break;
-
-                case CodeFormattingPreset.Custom:
-                default:
-                    break;
             }
 
-            logger.LogDebug("Created formatting hashtable: {0}", JsonConvert.SerializeObject(settings));
+            logger.LogDebug("Created formatting hashtable: {Settings}", JsonConvert.SerializeObject(settings));
             return settings;
         }
 
@@ -254,24 +254,35 @@ namespace Microsoft.PowerShell.EditorServices.Services.Configuration
         {
             Hashtable ruleConfigurations = new()
             {
-                { "PSPlaceOpenBrace", new Hashtable {
+                {
+                    "PSPlaceOpenBrace",
+                    new Hashtable {
                     { "Enable", true },
                     { "OnSameLine", OpenBraceOnSameLine },
                     { "NewLineAfter", NewLineAfterOpenBrace },
                     { "IgnoreOneLineBlock", IgnoreOneLineBlock }
-                }},
-                { "PSPlaceCloseBrace", new Hashtable {
+                }
+                },
+                {
+                    "PSPlaceCloseBrace",
+                    new Hashtable {
                     { "Enable", true },
                     { "NewLineAfter", NewLineAfterCloseBrace },
                     { "IgnoreOneLineBlock", IgnoreOneLineBlock }
-                }},
-                { "PSUseConsistentIndentation", new Hashtable {
+                }
+                },
+                {
+                    "PSUseConsistentIndentation",
+                    new Hashtable {
                     { "Enable", true },
                     { "IndentationSize", tabSize },
                     { "PipelineIndentation", PipelineIndentationStyle },
                     { "Kind", insertSpaces ? "space" : "tab" }
-                }},
-                { "PSUseConsistentWhitespace", new Hashtable {
+                }
+                },
+                {
+                    "PSUseConsistentWhitespace",
+                    new Hashtable {
                     { "Enable", true },
                     { "CheckOpenBrace", WhitespaceBeforeOpenBrace },
                     { "CheckOpenParen", WhitespaceBeforeOpenParen },
@@ -281,17 +292,33 @@ namespace Microsoft.PowerShell.EditorServices.Services.Configuration
                     { "CheckParameter", WhitespaceBetweenParameters },
                     { "CheckPipe", AddWhitespaceAroundPipe },
                     { "CheckPipeForRedundantWhitespace", TrimWhitespaceAroundPipe },
-                }},
-                { "PSAlignAssignmentStatement", new Hashtable {
+                }
+                },
+                {
+                    "PSAlignAssignmentStatement",
+                    new Hashtable {
                     { "Enable", true },
                     { "CheckHashtable", AlignPropertyValuePairs }
-                }},
-                { "PSUseCorrectCasing", new Hashtable {
+                }
+                },
+                {
+                    "PSUseCorrectCasing",
+                    new Hashtable {
                     { "Enable", UseCorrectCasing }
-                }},
-                { "PSAvoidUsingDoubleQuotesForConstantString", new Hashtable {
+                }
+                },
+                {
+                    "PSAvoidUsingDoubleQuotesForConstantString",
+                    new Hashtable {
                     { "Enable", UseConstantStrings }
-                }},
+                }
+                },
+                {
+                    "PSAvoidSemicolonsAsLineTerminators",
+                    new Hashtable {
+                    { "Enable", AvoidSemicolonsAsLineTerminators }
+                    }
+                },
             };
 
             if (AutoCorrectAliases)
@@ -368,7 +395,7 @@ namespace Microsoft.PowerShell.EditorServices.Services.Configuration
         /// <summary>
         /// Whether integration features specific to Pester v5 are enabled
         /// </summary>
-        public bool UseLegacyCodeLens { get; set; } = false;
+        public bool UseLegacyCodeLens { get; set; }
 
         /// <summary>
         /// Update these settings from another settings object

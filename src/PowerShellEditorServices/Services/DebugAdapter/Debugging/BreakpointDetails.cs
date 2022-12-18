@@ -11,7 +11,7 @@ namespace Microsoft.PowerShell.EditorServices.Services.DebugAdapter
     /// Provides details about a breakpoint that is set in the
     /// PowerShell debugger.
     /// </summary>
-    internal class BreakpointDetails : BreakpointDetailsBase
+    internal sealed class BreakpointDetails : BreakpointDetailsBase
     {
         /// <summary>
         /// Gets the unique ID of the breakpoint.
@@ -49,6 +49,7 @@ namespace Microsoft.PowerShell.EditorServices.Services.DebugAdapter
         /// <param name="column"></param>
         /// <param name="condition"></param>
         /// <param name="hitCondition"></param>
+        /// <param name="logMessage"></param>
         /// <returns></returns>
         internal static BreakpointDetails Create(
             string source,
@@ -91,7 +92,7 @@ namespace Microsoft.PowerShell.EditorServices.Services.DebugAdapter
                     "Unexpected breakpoint type: " + breakpoint.GetType().Name);
             }
 
-            var breakpointDetails = new BreakpointDetails
+            BreakpointDetails breakpointDetails = new()
             {
                 Id = breakpoint.Id,
                 Verified = updateType != BreakpointUpdateType.Disabled,

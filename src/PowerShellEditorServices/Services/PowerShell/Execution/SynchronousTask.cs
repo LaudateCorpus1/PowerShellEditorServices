@@ -76,10 +76,11 @@ namespace Microsoft.PowerShell.EditorServices.Services.PowerShell.Execution
         {
             if (IsCanceled)
             {
+                SetCanceled();
                 return;
             }
 
-            using var cancellationSource = CancellationTokenSource.CreateLinkedTokenSource(_taskRequesterCancellationToken, executorCancellationToken);
+            using CancellationTokenSource cancellationSource = CancellationTokenSource.CreateLinkedTokenSource(_taskRequesterCancellationToken, executorCancellationToken);
             if (cancellationSource.IsCancellationRequested)
             {
                 SetCanceled();

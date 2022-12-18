@@ -4,6 +4,7 @@
 using System;
 using System.Collections.Generic;
 using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.PowerShell.EditorServices.Services;
 using Microsoft.PowerShell.EditorServices.Services.Symbols;
@@ -26,15 +27,17 @@ namespace Microsoft.PowerShell.EditorServices.CodeLenses
         /// <summary>
         /// The document symbol provider to supply symbols to generate the code lenses.
         /// </summary>
-        private IDocumentSymbolProvider _symbolProvider;
+        private readonly IDocumentSymbolProvider _symbolProvider;
         private readonly SymbolsService _symbolsService;
         private readonly WorkspaceService _workspaceService;
+
+        public static string Id => nameof(ReferencesCodeLensProvider);
 
         /// <summary>
         /// Specifies a unique identifier for the feature provider, typically a
         /// fully-qualified name like "Microsoft.PowerShell.EditorServices.MyProvider"
         /// </summary>
-        public string ProviderId => nameof(ReferencesCodeLensProvider);
+        public string ProviderId => Id;
 
         /// <summary>
         /// Construct a new ReferencesCodeLensProvider for a given EditorSession.
@@ -53,12 +56,14 @@ namespace Microsoft.PowerShell.EditorServices.CodeLenses
         /// Get all reference code lenses for a given script file.
         /// </summary>
         /// <param name="scriptFile">The PowerShell script file to get code lenses for.</param>
+        /// <param name="cancellationToken"></param>
         /// <returns>An array of CodeLenses describing all functions in the given script file.</returns>
-        public CodeLens[] ProvideCodeLenses(ScriptFile scriptFile)
+        public CodeLens[] ProvideCodeLenses(ScriptFile scriptFile, CancellationToken cancellationToken)
         {
-            var acc = new List<CodeLens>();
+            List<CodeLens> acc = new();
             foreach (SymbolReference sym in _symbolProvider.ProvideDocumentSymbols(scriptFile))
             {
+                cancellationToken.ThrowIfCancellationRequested();
                 if (sym.SymbolType == SymbolType.Function)
                 {
                     acc.Add(new CodeLens
@@ -68,7 +73,7 @@ namespace Microsoft.PowerShell.EditorServices.CodeLenses
                             Uri = scriptFile.DocumentUri,
                             ProviderId = nameof(ReferencesCodeLensProvider)
                         }, LspSerializer.Instance.JsonSerializer),
-                        Range = sym.ScriptRegion.ToRange()
+                        Range = sym.ScriptRegion.ToRange(),
                     });
                 }
             }
@@ -81,8 +86,12 @@ namespace Microsoft.PowerShell.EditorServices.CodeLenses
         /// </summary>
         /// <param name="codeLens">The old code lens to get updated references for.</param>
         /// <param name="scriptFile"></param>
+        /// <param name="cancellationToken"></param>
         /// <returns>A new code lens object describing the same data as the old one but with updated references.</returns>
-        public async Task<CodeLens> ResolveCodeLens(CodeLens codeLens, ScriptFile scriptFile)
+        public async Task<CodeLens> ResolveCodeLens(
+            CodeLens codeLens,
+            ScriptFile scriptFile,
+            CancellationToken cancellationToken)
         {
             ScriptFile[] references = _workspaceService.ExpandScriptReferences(
                 scriptFile);
@@ -93,9 +102,10 @@ namespace Microsoft.PowerShell.EditorServices.CodeLenses
                 codeLens.Range.Start.Character + 1);
 
             List<SymbolReference> referencesResult = await _symbolsService.FindReferencesOfSymbol(
-                foundSymbol,
-                references,
-                _workspaceService).ConfigureAwait(false);
+                    foundSymbol,
+                    references,
+                    _workspaceService,
+                    cancellationToken).ConfigureAwait(false);
 
             Location[] referenceLocations;
             if (referencesResult == null)
@@ -104,9 +114,13 @@ namespace Microsoft.PowerShell.EditorServices.CodeLenses
             }
             else
             {
-                var acc = new List<Location>();
+                List<Location> acc = new();
                 foreach (SymbolReference foundReference in referencesResult)
                 {
+                    // This async method is pretty dense with synchronous code
+                    // so it's helpful to add some yields.
+                    await Task.Yield();
+                    cancellationToken.ThrowIfCancellationRequested();
                     if (IsReferenceDefinition(foundSymbol, foundReference))
                     {
                         continue;
@@ -183,7 +197,7 @@ namespace Microsoft.PowerShell.EditorServices.CodeLenses
                 return "1 reference";
             }
 
-            var sb = new StringBuilder(14); // "100 references".Length = 14
+            StringBuilder sb = new(14); // "100 references".Length = 14
             sb.Append(referenceCount);
             sb.Append(" references");
             return sb.ToString();

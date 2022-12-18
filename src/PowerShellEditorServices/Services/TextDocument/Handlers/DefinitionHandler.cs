@@ -4,7 +4,6 @@
 using System.Collections.Generic;
 using System.Threading;
 using System.Threading.Tasks;
-using Microsoft.Extensions.Logging;
 using Microsoft.PowerShell.EditorServices.Services;
 using Microsoft.PowerShell.EditorServices.Services.Symbols;
 using Microsoft.PowerShell.EditorServices.Services.TextDocument;
@@ -18,21 +17,18 @@ namespace Microsoft.PowerShell.EditorServices.Handlers
 {
     internal class PsesDefinitionHandler : DefinitionHandlerBase
     {
-        private readonly ILogger _logger;
         private readonly SymbolsService _symbolsService;
         private readonly WorkspaceService _workspaceService;
 
         public PsesDefinitionHandler(
-            ILoggerFactory factory,
             SymbolsService symbolsService,
             WorkspaceService workspaceService)
         {
-            _logger = factory.CreateLogger<PsesDefinitionHandler>();
             _symbolsService = symbolsService;
             _workspaceService = workspaceService;
         }
 
-        protected override DefinitionRegistrationOptions CreateRegistrationOptions(DefinitionCapability capability, ClientCapabilities clientCapabilities) => new DefinitionRegistrationOptions
+        protected override DefinitionRegistrationOptions CreateRegistrationOptions(DefinitionCapability capability, ClientCapabilities clientCapabilities) => new()
         {
             DocumentSelector = LspUtils.PowerShellDocumentSelector
         };
@@ -47,7 +43,7 @@ namespace Microsoft.PowerShell.EditorServices.Handlers
                     request.Position.Line + 1,
                     request.Position.Character + 1);
 
-            List<LocationOrLocationLink> definitionLocations = new List<LocationOrLocationLink>();
+            List<LocationOrLocationLink> definitionLocations = new();
             if (foundSymbol != null)
             {
                 SymbolReference foundDefinition = await _symbolsService.GetDefinitionOfSymbolAsync(

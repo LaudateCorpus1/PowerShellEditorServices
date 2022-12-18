@@ -4,7 +4,6 @@
 using System.Collections.Generic;
 using System.Threading;
 using System.Threading.Tasks;
-using Microsoft.Extensions.Logging;
 using Microsoft.PowerShell.EditorServices.Services;
 using Microsoft.PowerShell.EditorServices.Services.Symbols;
 using Microsoft.PowerShell.EditorServices.Services.TextDocument;
@@ -16,25 +15,23 @@ using OmniSharp.Extensions.LanguageServer.Protocol.Models;
 
 namespace Microsoft.PowerShell.EditorServices.Handlers
 {
-    class PsesReferencesHandler : ReferencesHandlerBase
+    internal class PsesReferencesHandler : ReferencesHandlerBase
     {
-        private readonly ILogger _logger;
         private readonly SymbolsService _symbolsService;
         private readonly WorkspaceService _workspaceService;
 
-        public PsesReferencesHandler(ILoggerFactory factory, SymbolsService symbolsService, WorkspaceService workspaceService)
+        public PsesReferencesHandler(SymbolsService symbolsService, WorkspaceService workspaceService)
         {
-            _logger = factory.CreateLogger<PsesReferencesHandler>();
             _symbolsService = symbolsService;
             _workspaceService = workspaceService;
         }
 
-        protected override ReferenceRegistrationOptions CreateRegistrationOptions(ReferenceCapability capability, ClientCapabilities clientCapabilities) => new ReferenceRegistrationOptions
+        protected override ReferenceRegistrationOptions CreateRegistrationOptions(ReferenceCapability capability, ClientCapabilities clientCapabilities) => new()
         {
             DocumentSelector = LspUtils.PowerShellDocumentSelector
         };
 
-        public async override Task<LocationContainer> Handle(ReferenceParams request, CancellationToken cancellationToken)
+        public override async Task<LocationContainer> Handle(ReferenceParams request, CancellationToken cancellationToken)
         {
             ScriptFile scriptFile = _workspaceService.GetFile(request.TextDocument.Uri);
 
@@ -48,9 +45,10 @@ namespace Microsoft.PowerShell.EditorServices.Handlers
                 await _symbolsService.FindReferencesOfSymbol(
                     foundSymbol,
                     _workspaceService.ExpandScriptReferences(scriptFile),
-                    _workspaceService).ConfigureAwait(false);
+                    _workspaceService,
+                    cancellationToken).ConfigureAwait(false);
 
-            var locations = new List<Location>();
+            List<Location> locations = new();
 
             if (referencesResult != null)
             {

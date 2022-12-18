@@ -5,7 +5,6 @@ using System.Collections.Generic;
 using System.Management.Automation;
 using System.Threading;
 using System.Threading.Tasks;
-using Microsoft.Extensions.Logging;
 using MediatR;
 using OmniSharp.Extensions.JsonRpc;
 using Microsoft.PowerShell.EditorServices.Services.PowerShell;
@@ -32,18 +31,13 @@ namespace Microsoft.PowerShell.EditorServices.Handlers
 
     internal class GetCommandHandler : IGetCommandHandler
     {
-        private readonly ILogger<GetCommandHandler> _logger;
         private readonly IInternalPowerShellExecutionService _executionService;
 
-        public GetCommandHandler(ILoggerFactory factory, IInternalPowerShellExecutionService executionService)
-        {
-            _logger = factory.CreateLogger<GetCommandHandler>();
-            _executionService = executionService;
-        }
+        public GetCommandHandler(IInternalPowerShellExecutionService executionService) => _executionService = executionService;
 
         public async Task<List<PSCommandMessage>> Handle(GetCommandParams request, CancellationToken cancellationToken)
         {
-            PSCommand psCommand = new PSCommand();
+            PSCommand psCommand = new();
 
             // Executes the following:
             // Get-Command -CommandType Function,Cmdlet,ExternalScript | Sort-Object -Property Name
@@ -55,7 +49,7 @@ namespace Microsoft.PowerShell.EditorServices.Handlers
 
             IEnumerable<CommandInfo> result = await _executionService.ExecutePSCommandAsync<CommandInfo>(psCommand, cancellationToken).ConfigureAwait(false);
 
-            var commandList = new List<PSCommandMessage>();
+            List<PSCommandMessage> commandList = new();
             if (result != null)
             {
                 foreach (CommandInfo command in result)

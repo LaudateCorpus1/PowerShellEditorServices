@@ -12,6 +12,7 @@ using Microsoft.PowerShell.EditorServices.Logging;
 using Microsoft.PowerShell.EditorServices.Services.DebugAdapter;
 using Microsoft.PowerShell.EditorServices.Services.PowerShell;
 using Microsoft.PowerShell.EditorServices.Services.PowerShell.Host;
+using Microsoft.PowerShell.EditorServices.Services.PowerShell.Utility;
 
 namespace Microsoft.PowerShell.EditorServices.Services
 {
@@ -43,6 +44,7 @@ namespace Microsoft.PowerShell.EditorServices.Services
         {
             if (BreakpointApiUtils.SupportsBreakpointApis(_editorServicesHost.CurrentRunspace))
             {
+                _editorServicesHost.Runspace.ThrowCancelledIfUnusable();
                 return BreakpointApiUtils.GetBreakpoints(
                     _editorServicesHost.Runspace.Debugger,
                     _debugStateService.RunspaceId);
@@ -67,7 +69,7 @@ namespace Microsoft.PowerShell.EditorServices.Services
                     {
                         BreakpointApiUtils.SetBreakpoint(_editorServicesHost.Runspace.Debugger, breakpointDetails, _debugStateService.RunspaceId);
                     }
-                    catch(InvalidOperationException e)
+                    catch (InvalidOperationException e)
                     {
                         breakpointDetails.Message = e.Message;
                         breakpointDetails.Verified = false;
@@ -247,7 +249,7 @@ namespace Microsoft.PowerShell.EditorServices.Services
                 }
 
                 // Legacy behavior
-                var psCommand = new PSCommand().AddCommand(@"Microsoft.PowerShell.Utility\Get-PSBreakpoint");
+                PSCommand psCommand = new PSCommand().AddCommand(@"Microsoft.PowerShell.Utility\Get-PSBreakpoint");
 
                 if (!string.IsNullOrEmpty(scriptPath))
                 {
@@ -286,7 +288,7 @@ namespace Microsoft.PowerShell.EditorServices.Services
             }
 
             // Legacy behavior
-            var breakpointIds = breakpoints.Select(b => b.Id);
+            IEnumerable<int> breakpointIds = breakpoints.Select(b => b.Id);
             if (breakpointIds.Any())
             {
                 PSCommand psCommand = new PSCommand()

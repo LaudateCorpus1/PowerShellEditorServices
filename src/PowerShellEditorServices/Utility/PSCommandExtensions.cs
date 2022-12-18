@@ -18,7 +18,7 @@ namespace Microsoft.PowerShell.EditorServices.Utility
 
         static PSCommandHelpers()
         {
-            var ctor = typeof(Command).GetConstructor(
+            ConstructorInfo ctor = typeof(Command).GetConstructor(
                 BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public,
                 binder: null,
                 new[] { typeof(CommandInfo) },
@@ -42,7 +42,7 @@ namespace Microsoft.PowerShell.EditorServices.Utility
         /// <returns></returns>
         public static PSCommand AddCommand(this PSCommand command, CommandInfo commandInfo)
         {
-            var rsCommand = s_commandCtor(commandInfo);
+            Command rsCommand = s_commandCtor(commandInfo);
             return command.AddCommand(rsCommand);
         }
 
@@ -77,10 +77,7 @@ namespace Microsoft.PowerShell.EditorServices.Utility
 
             if (File.Exists(profilePath))
             {
-                psCommand
-                    .AddCommand(profilePath, useLocalScope: false)
-                    .AddOutputCommand()
-                    .AddStatement();
+                psCommand.AddCommand(profilePath, useLocalScope: false).AddOutputCommand().AddStatement();
             }
 
             return psCommand;
@@ -93,7 +90,7 @@ namespace Microsoft.PowerShell.EditorServices.Utility
         public static string GetInvocationText(this PSCommand command)
         {
             Command currentCommand = command.Commands[0];
-            var sb = new StringBuilder().AddCommandText(command.Commands[0]);
+            StringBuilder sb = new StringBuilder().AddCommandText(command.Commands[0]);
 
             for (int i = 1; i < command.Commands.Count; i++)
             {
@@ -128,6 +125,8 @@ namespace Microsoft.PowerShell.EditorServices.Utility
 
             return sb;
         }
+
+        public static string EscapeScriptFilePath(string f) => string.Concat("'", f.Replace("'", "''"), "'");
 
         public static PSCommand BuildDotSourceCommandWithArguments(string command, IEnumerable<string> arguments)
         {

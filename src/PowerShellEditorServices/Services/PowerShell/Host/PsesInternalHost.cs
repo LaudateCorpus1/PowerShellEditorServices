@@ -1,4 +1,4 @@
-﻿// Copyright (c) Microsoft Corporation.
+// Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
 using System;
@@ -6,7 +6,7 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
 using System.Management.Automation.Host;
-using System.Text;
+using System.Reflection;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
@@ -24,22 +24,30 @@ namespace Microsoft.PowerShell.EditorServices.Services.PowerShell.Host
 {
     using System.Management.Automation;
     using System.Management.Automation.Runspaces;
+    // NOTE: These last three are for a workaround for temporary Extension Terminals.
+    using Microsoft.PowerShell.EditorServices.Handlers;
+    using Microsoft.PowerShell.EditorServices.Server;
+    using OmniSharp.Extensions.DebugAdapter.Protocol.Server;
 
     internal class PsesInternalHost : PSHost, IHostSupportsInteractiveSession, IRunspaceContext, IInternalPowerShellExecutionService
     {
-        private const string DefaultPrompt = "PSIC> ";
-        // This is a default that can be overriden at runtime by the user or tests.
-        private static string s_bundledModulePath = Path.GetFullPath(Path.Combine(
-            Path.GetDirectoryName(typeof(PsesInternalHost).Assembly.Location), "..", "..", ".."));
+        internal const string DefaultPrompt = "> ";
 
-        private static string CommandsModulePath => Path.GetFullPath(Path.Combine(
-            s_bundledModulePath, "PowerShellEditorServices", "Commands", "PowerShellEditorServices.Commands.psd1"));
+        private static readonly PropertyInfo s_scriptDebuggerTriggerObjectProperty;
 
         private readonly ILoggerFactory _loggerFactory;
 
         private readonly ILogger _logger;
 
         private readonly ILanguageServerFacade _languageServer;
+
+        /// <summary>
+        /// TODO: Improve this coupling. It's assigned by <see cref="PsesDebugServer.StartAsync()" />
+        /// so that the PowerShell process started when <see cref="PsesLaunchRequestArguments.CreateTemporaryIntegratedConsole" />
+        /// is true can also receive the required 'sendKeyPress' notification to return from a
+        /// canceled <see cref="System.Console.ReadKey()" />.
+        /// </summary>
+        internal IDebugAdapterServerFacade DebugServer;
 
         private readonly HostStartupInfo _hostInfo;
 
@@ -51,7 +59,7 @@ namespace Microsoft.PowerShell.EditorServices.Services.PowerShell.Host
 
         private readonly CancellationContext _cancellationContext;
 
-        private readonly ReadLineProvider _readLineProvider;
+        internal readonly ReadLineProvider _readLineProvider;
 
         private readonly Thread _pipelineThread;
 
@@ -63,17 +71,36 @@ namespace Microsoft.PowerShell.EditorServices.Services.PowerShell.Host
 
         private EngineIntrinsics _mainRunspaceEngineIntrinsics;
 
-        private bool _shouldExit = false;
+        private bool _shouldExit;
 
-        private int _shuttingDown = 0;
+        private int _shuttingDown;
 
         private string _localComputerName;
 
+        private bool _shellIntegrationEnabled;
+
         private ConsoleKeyInfo? _lastKey;
 
-        private bool _skipNextPrompt = false;
+        private bool _skipNextPrompt;
 
-        private bool _resettingRunspace = false;
+        private CancellationToken _readKeyCancellationToken;
+
+        private bool _resettingRunspace;
+
+        static PsesInternalHost()
+        {
+            Type scriptDebuggerType = typeof(PSObject).Assembly
+                .GetType("System.Management.Automation.ScriptDebugger");
+
+            if (scriptDebuggerType is null)
+            {
+                return;
+            }
+
+            s_scriptDebuggerTriggerObjectProperty = scriptDebuggerType.GetProperty(
+                "TriggerObject",
+                BindingFlags.Instance | BindingFlags.NonPublic);
+        }
 
         public PsesInternalHost(
             ILoggerFactory loggerFactory,
@@ -84,21 +111,22 @@ namespace Microsoft.PowerShell.EditorServices.Services.PowerShell.Host
             _logger = loggerFactory.CreateLogger<PsesInternalHost>();
             _languageServer = languageServer;
             _hostInfo = hostInfo;
-
-            // Respect a user provided bundled module path.
-            if (Directory.Exists(hostInfo.BundledModulePath))
-            {
-                _logger.LogTrace("Using new bundled module path: {}", hostInfo.BundledModulePath);
-                s_bundledModulePath = hostInfo.BundledModulePath;
-            }
-
             _readLineProvider = new ReadLineProvider(loggerFactory);
             _taskQueue = new BlockingConcurrentDeque<ISynchronousTask>();
             _psFrameStack = new Stack<PowerShellContextFrame>();
             _runspaceStack = new Stack<RunspaceFrame>();
             _cancellationContext = new CancellationContext();
 
-            _pipelineThread = new Thread(Run)
+            // Default stack size on .NET Framework is 524288 (512KB) (as reported by GetProcessDefaultStackSize)
+            // this leaves very little room in the stack. Windows PowerShell internally sets the value based on
+            // PipelineMaxStackSizeMB as seen here: https://github.com/PowerShell/PowerShell/issues/1187,
+            // which has default of 10 and multiplies that by 1_000_000, so the default stack size is
+            // 10_000_000 (~10MB) when starting in normal console host.
+            //
+            // For PS7 the value is ignored by .NET because settings the stack size is not supported, but we can
+            // still provide 0, which means fallback to the default in both .NET and .NET Framework.
+            int maxStackSize = VersionUtils.IsPS5 ? 10_000_000 : 0;
+            _pipelineThread = new Thread(Run, maxStackSize)
             {
                 Name = "PSES Pipeline Execution Thread",
             };
@@ -114,7 +142,7 @@ namespace Microsoft.PowerShell.EditorServices.Services.PowerShell.Host
 
             DebugContext = new PowerShellDebugContext(loggerFactory, this);
             UI = hostInfo.ConsoleReplEnabled
-                ? new EditorServicesConsolePSHostUserInterface(loggerFactory, _readLineProvider, hostInfo.PSHost.UI)
+                ? new EditorServicesConsolePSHostUserInterface(loggerFactory, hostInfo.PSHost.UI)
                 : new NullPSHostUI();
         }
 
@@ -125,6 +153,8 @@ namespace Microsoft.PowerShell.EditorServices.Services.PowerShell.Host
         public override Guid InstanceId { get; } = Guid.NewGuid();
 
         public override string Name { get; }
+
+        public override PSObject PrivateData => _hostInfo.PSHost.PrivateData;
 
         public override PSHostUserInterface UI { get; }
 
@@ -144,53 +174,58 @@ namespace Microsoft.PowerShell.EditorServices.Services.PowerShell.Host
 
         public bool IsRunning => _isRunningLatch.IsSignaled;
 
-        public string InitialWorkingDirectory { get; private set; }
-
         public Task Shutdown => _stopped.Task;
 
         IRunspaceInfo IRunspaceContext.CurrentRunspace => CurrentRunspace;
 
-        private PowerShellContextFrame CurrentFrame => _psFrameStack.Peek();
+        internal PowerShellContextFrame CurrentFrame => _psFrameStack.Peek();
 
         public event Action<object, RunspaceChangedEventArgs> RunspaceChanged;
 
         private bool ShouldExitExecutionLoop => _shouldExit || _shuttingDown != 0;
 
-        public override void EnterNestedPrompt()
-        {
-            PushPowerShellAndRunLoop(CreateNestedPowerShell(CurrentRunspace), PowerShellFrameType.Nested);
-        }
+        public override void EnterNestedPrompt() => PushPowerShellAndRunLoop(
+            CreateNestedPowerShell(CurrentRunspace),
+            PowerShellFrameType.Nested | PowerShellFrameType.Repl);
 
-        public override void ExitNestedPrompt()
-        {
-            SetExit();
-        }
+        public override void ExitNestedPrompt() => SetExit();
 
-        public override void NotifyBeginApplication()
-        {
-            // TODO: Work out what to do here
-        }
+        public override void NotifyBeginApplication() => _hostInfo.PSHost.NotifyBeginApplication();
 
-        public override void NotifyEndApplication()
-        {
-            // TODO: Work out what to do here
-        }
+        public override void NotifyEndApplication() => _hostInfo.PSHost.NotifyEndApplication();
 
         public void PopRunspace()
         {
+            if (!Runspace.RunspaceIsRemote)
+            {
+                return;
+            }
+
             IsRunspacePushed = false;
+            CurrentFrame.SessionExiting = true;
+            PopPowerShell();
             SetExit();
         }
 
         public void PushRunspace(Runspace runspace)
         {
             IsRunspacePushed = true;
-            PushPowerShellAndRunLoop(CreatePowerShellForRunspace(runspace), PowerShellFrameType.Remote);
+            PushPowerShellAndMaybeRunLoop(
+                CreatePowerShellForRunspace(runspace),
+                PowerShellFrameType.Remote | PowerShellFrameType.Repl,
+                skipRunLoop: true);
         }
 
+        // TODO: Handle exit code if needed
         public override void SetShouldExit(int exitCode)
         {
-            // TODO: Handle exit code if needed
+            if (CurrentFrame.IsRemote)
+            {
+                // PopRunspace also calls SetExit.
+                PopRunspace();
+                return;
+            }
+
             SetExit();
         }
 
@@ -204,7 +239,7 @@ namespace Microsoft.PowerShell.EditorServices.Services.PowerShell.Host
         /// <returns>A task that resolves when the host has finished startup, with the value true if the caller started the host, and false otherwise.</returns>
         public async Task<bool> TryStartAsync(HostStartOptions startOptions, CancellationToken cancellationToken)
         {
-            _logger.LogInformation("Host starting");
+            _logger.LogDebug("Starting host...");
             if (!_isRunningLatch.TryEnter())
             {
                 _logger.LogDebug("Host start requested after already started.");
@@ -216,13 +251,28 @@ namespace Microsoft.PowerShell.EditorServices.Services.PowerShell.Host
 
             if (startOptions.LoadProfiles)
             {
+                _logger.LogDebug("Loading profiles...");
                 await LoadHostProfilesAsync(cancellationToken).ConfigureAwait(false);
-                _logger.LogInformation("Profiles loaded");
+                _logger.LogDebug("Profiles loaded!");
+            }
+
+            if (startOptions.ShellIntegrationEnabled)
+            {
+                _logger.LogDebug("Enabling shell integration...");
+                _shellIntegrationEnabled = true;
+                await EnableShellIntegrationAsync(cancellationToken).ConfigureAwait(false);
+                _logger.LogDebug("Shell integration enabled!");
+            }
+            else
+            {
+                _logger.LogDebug("Shell integration not enabled!");
             }
 
             if (startOptions.InitialWorkingDirectory is not null)
             {
-                await SetInitialWorkingDirectoryAsync(startOptions.InitialWorkingDirectory, CancellationToken.None).ConfigureAwait(false);
+                _logger.LogDebug($"Setting InitialWorkingDirectory to {startOptions.InitialWorkingDirectory}...");
+                await SetInitialWorkingDirectoryAsync(startOptions.InitialWorkingDirectory, cancellationToken).ConfigureAwait(false);
+                _logger.LogDebug("InitialWorkingDirectory set!");
             }
 
             await _started.Task.ConfigureAwait(false);
@@ -237,14 +287,10 @@ namespace Microsoft.PowerShell.EditorServices.Services.PowerShell.Host
 
         public void TriggerShutdown()
         {
+            _logger.LogDebug("Shutting down host...");
             if (Interlocked.Exchange(ref _shuttingDown, 1) == 0)
             {
                 _cancellationContext.CancelCurrentTaskStack();
-                // NOTE: This is mostly for sanity's sake, as during debugging of tests I became
-                // concerned that the repeated creation and disposal of the host was not also
-                // joining and disposing this thread, leaving the tests in a weird state. Because
-                // the tasks have been canceled, we should be able to join this thread.
-                _pipelineThread.Join();
             }
         }
 
@@ -252,7 +298,8 @@ namespace Microsoft.PowerShell.EditorServices.Services.PowerShell.Host
         {
             // Can't exit from the top level of PSES
             // since if you do, you lose all LSP services
-            if (_psFrameStack.Count <= 1)
+            PowerShellContextFrame frame = CurrentFrame;
+            if (!frame.IsRepl || _psFrameStack.Count <= 1)
             {
                 return;
             }
@@ -260,25 +307,79 @@ namespace Microsoft.PowerShell.EditorServices.Services.PowerShell.Host
             _shouldExit = true;
         }
 
-        public Task<T> InvokeTaskOnPipelineThreadAsync<T>(
-            SynchronousTask<T> task)
+        internal void ForceSetExit() => _shouldExit = true;
+
+        private void SetBusy(bool busy) => _languageServer?.SendNotification("powerShell/executionBusyStatus", busy);
+
+        private bool CancelForegroundAndPrepend(ISynchronousTask task, bool isIdle = false)
         {
-            if (task.ExecutionOptions.InterruptCurrentForeground)
+            // NOTE: This causes foreground tasks to act like they have `ExecutionPriority.Next`.
+            //
+            // When a task must displace the current foreground command,
+            // we must:
+            //  - block the consumer thread from mutating the queue
+            //  - cancel any running task on the consumer thread
+            //  - place our task on the front of the queue
+            //  - skip the next prompt so the task runs instead
+            //  - unblock the consumer thread
+            if (!task.ExecutionOptions.RequiresForeground)
             {
-                // When a task must displace the current foreground command,
-                // we must:
-                //  - block the consumer thread from mutating the queue
-                //  - cancel any running task on the consumer thread
-                //  - place our task on the front of the queue
-                //  - skip the next prompt so the task runs instead
-                //  - unblock the consumer thread
-                using (_taskQueue.BlockConsumers())
+                return false;
+            }
+
+            _skipNextPrompt = true;
+
+            if (task is ISynchronousPowerShellTask t)
+            {
+                t.MaybeAddToHistory();
+            }
+
+            using (_taskQueue.BlockConsumers())
+            {
+                _taskQueue.Prepend(task);
+                if (isIdle)
+                {
+                    CancelIdleParentTask();
+                }
+                else
                 {
                     CancelCurrentTask();
-                    _taskQueue.Prepend(task);
-                    _skipNextPrompt = true;
                 }
+            }
 
+            return true;
+        }
+
+        // This handles executing the task while also notifying the client that the pipeline is
+        // currently busy with a PowerShell task. The extension indicates this with a spinner.
+        private void ExecuteTaskSynchronously(ISynchronousTask task, CancellationToken cancellationToken)
+        {
+            // TODO: Simplify this logic.
+            bool busy = false;
+            if (task is ISynchronousPowerShellTask t
+                && (t.PowerShellExecutionOptions.AddToHistory
+                    || t.PowerShellExecutionOptions.FromRepl))
+            {
+                busy = true;
+                SetBusy(true);
+            }
+            try
+            {
+                task.ExecuteSynchronously(cancellationToken);
+            }
+            finally
+            {
+                if (busy)
+                {
+                    SetBusy(false);
+                }
+            }
+        }
+
+        public Task<T> InvokeTaskOnPipelineThreadAsync<T>(SynchronousTask<T> task)
+        {
+            if (CancelForegroundAndPrepend(task))
+            {
                 return task.Task;
             }
 
@@ -296,10 +397,11 @@ namespace Microsoft.PowerShell.EditorServices.Services.PowerShell.Host
             return task.Task;
         }
 
-        public void CancelCurrentTask()
-        {
-            _cancellationContext.CancelCurrentTask();
-        }
+        public void CancelCurrentTask() => _cancellationContext.CancelCurrentTask();
+
+        public void CancelIdleParentTask() => _cancellationContext.CancelIdleParentTask();
+
+        public void UnwindCallStack() => _cancellationContext.CancelCurrentTaskStack();
 
         public Task<TResult> ExecuteDelegateAsync<TResult>(
             string representation,
@@ -353,62 +455,149 @@ namespace Microsoft.PowerShell.EditorServices.Services.PowerShell.Host
         public Task ExecutePSCommandAsync(
             PSCommand psCommand,
             CancellationToken cancellationToken,
-            PowerShellExecutionOptions executionOptions = null)
-        {
-            return ExecutePSCommandAsync<PSObject>(psCommand, cancellationToken, executionOptions);
-        }
+            PowerShellExecutionOptions executionOptions = null) => ExecutePSCommandAsync<PSObject>(psCommand, cancellationToken, executionOptions);
 
         public TResult InvokeDelegate<TResult>(string representation, ExecutionOptions executionOptions, Func<CancellationToken, TResult> func, CancellationToken cancellationToken)
         {
-            var task = new SynchronousDelegateTask<TResult>(_logger, representation, executionOptions, func, cancellationToken);
+            SynchronousDelegateTask<TResult> task = new(_logger, representation, executionOptions, func, cancellationToken);
             return task.ExecuteAndGetResult(cancellationToken);
         }
 
         public void InvokeDelegate(string representation, ExecutionOptions executionOptions, Action<CancellationToken> action, CancellationToken cancellationToken)
         {
-            var task = new SynchronousDelegateTask(_logger, representation, executionOptions, action, cancellationToken);
+            SynchronousDelegateTask task = new(_logger, representation, executionOptions, action, cancellationToken);
             task.ExecuteAndGetResult(cancellationToken);
         }
 
         public IReadOnlyList<TResult> InvokePSCommand<TResult>(PSCommand psCommand, PowerShellExecutionOptions executionOptions, CancellationToken cancellationToken)
         {
-            var task = new SynchronousPowerShellTask<TResult>(_logger, this, psCommand, executionOptions, cancellationToken);
+            SynchronousPowerShellTask<TResult> task = new(_logger, this, psCommand, executionOptions, cancellationToken);
             return task.ExecuteAndGetResult(cancellationToken);
         }
 
-        public void InvokePSCommand(PSCommand psCommand, PowerShellExecutionOptions executionOptions, CancellationToken cancellationToken)
-        {
-            InvokePSCommand<PSObject>(psCommand, executionOptions, cancellationToken);
-        }
+        public void InvokePSCommand(PSCommand psCommand, PowerShellExecutionOptions executionOptions, CancellationToken cancellationToken) => InvokePSCommand<PSObject>(psCommand, executionOptions, cancellationToken);
 
         public TResult InvokePSDelegate<TResult>(string representation, ExecutionOptions executionOptions, Func<PowerShell, CancellationToken, TResult> func, CancellationToken cancellationToken)
         {
-            var task = new SynchronousPSDelegateTask<TResult>(_logger, this, representation, executionOptions, func, cancellationToken);
+            SynchronousPSDelegateTask<TResult> task = new(_logger, this, representation, executionOptions, func, cancellationToken);
             return task.ExecuteAndGetResult(cancellationToken);
         }
 
         public void InvokePSDelegate(string representation, ExecutionOptions executionOptions, Action<PowerShell, CancellationToken> action, CancellationToken cancellationToken)
         {
-            var task = new SynchronousPSDelegateTask(_logger, this, representation, executionOptions, action, cancellationToken);
+            SynchronousPSDelegateTask task = new(_logger, this, representation, executionOptions, action, cancellationToken);
             task.ExecuteAndGetResult(cancellationToken);
         }
 
+        internal void AddToHistory(string historyEntry) => _readLineProvider.ReadLine.AddToHistory(historyEntry);
+
         internal Task LoadHostProfilesAsync(CancellationToken cancellationToken)
         {
+            // NOTE: This is a special task run on startup!
             return ExecuteDelegateAsync(
                 "LoadProfiles",
-                new PowerShellExecutionOptions { MustRunInForeground = true, ThrowOnError = false },
+                executionOptions: null,
                 (pwsh, _) => pwsh.LoadProfiles(_hostInfo.ProfilePaths),
                 cancellationToken);
         }
 
+        private Task EnableShellIntegrationAsync(CancellationToken cancellationToken)
+        {
+            // Imported on 11/17/22 from
+            // https://github.com/microsoft/vscode/blob/main/src/vs/workbench/contrib/terminal/browser/media/shellIntegration.ps1
+            // with quotes escaped, `__VSCodeOriginalPSConsoleHostReadLine` removed (as it's done
+            // in our own ReadLine function), and `[Console]::Write` replaced with `Write-Host`.
+            // TODO: We can probably clean some of this up.
+            const string shellIntegrationScript = @"
+# Prevent installing more than once per session
+if (Test-Path variable:global:__VSCodeOriginalPrompt) {
+	return;
+}
+
+# Disable shell integration when the language mode is restricted
+if ($ExecutionContext.SessionState.LanguageMode -ne ""FullLanguage"") {
+	return;
+}
+
+$Global:__VSCodeOriginalPrompt = $function:Prompt
+
+$Global:__LastHistoryId = -1
+
+
+function Global:Prompt() {
+	$FakeCode = [int]!$global:?
+	$LastHistoryEntry = Get-History -Count 1
+	# Skip finishing the command if the first command has not yet started
+	if ($Global:__LastHistoryId -ne -1) {
+		if ($LastHistoryEntry.Id -eq $Global:__LastHistoryId) {
+			# Don't provide a command line or exit code if there was no history entry (eg. ctrl+c, enter on no command)
+			$Result  = ""$([char]0x1b)]633;E`a""
+			$Result += ""$([char]0x1b)]633;D`a""
+		} else {
+			# Command finished command line
+			# OSC 633 ; A ; <CommandLine?> ST
+			$Result  = ""$([char]0x1b)]633;E;""
+			# Sanitize the command line to ensure it can get transferred to the terminal and can be parsed
+			# correctly. This isn't entirely safe but good for most cases, it's important for the Pt parameter
+			# to only be composed of _printable_ characters as per the spec.
+			if ($LastHistoryEntry.CommandLine) {
+				$CommandLine = $LastHistoryEntry.CommandLine
+			} else {
+				$CommandLine = """"
+			}
+			$Result += $CommandLine.Replace(""\"", ""\\"").Replace(""`n"", ""\x0a"").Replace("";"", ""\x3b"")
+			$Result += ""`a""
+			# Command finished exit code
+			# OSC 633 ; D [; <ExitCode>] ST
+			$Result += ""$([char]0x1b)]633;D;$FakeCode`a""
+		}
+	}
+	# Prompt started
+	# OSC 633 ; A ST
+	$Result += ""$([char]0x1b)]633;A`a""
+	# Current working directory
+	# OSC 633 ; <Property>=<Value> ST
+	$Result += if($pwd.Provider.Name -eq 'FileSystem'){""$([char]0x1b)]633;P;Cwd=$($pwd.ProviderPath)`a""}
+	# Before running the original prompt, put $? back to what it was:
+	if ($FakeCode -ne 0) { Write-Error ""failure"" -ea ignore }
+	# Run the original prompt
+	$Result += $Global:__VSCodeOriginalPrompt.Invoke()
+	# Write command started
+	$Result += ""$([char]0x1b)]633;B`a""
+	$Global:__LastHistoryId = $LastHistoryEntry.Id
+	return $Result
+}
+
+# Set IsWindows property
+Write-Host -NoNewLine ""$([char]0x1b)]633;P;IsWindows=$($IsWindows)`a""
+
+# Set always on key handlers which map to default VS Code keybindings
+function Set-MappedKeyHandler {
+	param ([string[]] $Chord, [string[]]$Sequence)
+	$Handler = $(Get-PSReadLineKeyHandler -Chord $Chord | Select-Object -First 1)
+	if ($Handler) {
+		Set-PSReadLineKeyHandler -Chord $Sequence -Function $Handler.Function
+	}
+}
+function Set-MappedKeyHandlers {
+	Set-MappedKeyHandler -Chord Ctrl+Spacebar -Sequence 'F12,a'
+	Set-MappedKeyHandler -Chord Alt+Spacebar -Sequence 'F12,b'
+	Set-MappedKeyHandler -Chord Shift+Enter -Sequence 'F12,c'
+	Set-MappedKeyHandler -Chord Shift+End -Sequence 'F12,d'
+}
+Set-MappedKeyHandlers
+            ";
+
+            return ExecutePSCommandAsync(new PSCommand().AddScript(shellIntegrationScript), cancellationToken);
+        }
+
         public Task SetInitialWorkingDirectoryAsync(string path, CancellationToken cancellationToken)
         {
-            InitialWorkingDirectory = path;
-
-            return ExecutePSCommandAsync(
-                new PSCommand().AddCommand("Set-Location").AddParameter("LiteralPath", path),
-                cancellationToken);
+            return Directory.Exists(path)
+                ? ExecutePSCommandAsync(
+                    new PSCommand().AddCommand("Set-Location").AddParameter("LiteralPath", path),
+                    cancellationToken)
+                : Task.CompletedTask;
         }
 
         private void Run()
@@ -419,7 +608,7 @@ namespace Microsoft.PowerShell.EditorServices.Services.PowerShell.Host
                 _mainRunspaceEngineIntrinsics = engineIntrinsics;
                 _localComputerName = localRunspaceInfo.SessionDetails.ComputerName;
                 _runspaceStack.Push(new RunspaceFrame(pwsh.Runspace, localRunspaceInfo));
-                PushPowerShellAndRunLoop(pwsh, PowerShellFrameType.Normal, localRunspaceInfo);
+                PushPowerShellAndRunLoop(pwsh, PowerShellFrameType.Normal | PowerShellFrameType.Repl, localRunspaceInfo);
             }
             catch (Exception e)
             {
@@ -435,7 +624,28 @@ namespace Microsoft.PowerShell.EditorServices.Services.PowerShell.Host
             return (pwsh, localRunspaceInfo, engineIntrinsics);
         }
 
+        internal PowerShellContextFrame PushPowerShellForExecution()
+        {
+            PowerShellContextFrame frame = CurrentFrame;
+            PowerShellFrameType currentFrameType = frame.FrameType;
+            currentFrameType &= ~PowerShellFrameType.Repl;
+            PowerShellContextFrame newFrame = new(
+                frame.PowerShell.CloneForNewFrame(),
+                frame.RunspaceInfo,
+                currentFrameType);
+
+            PushPowerShell(newFrame);
+            return newFrame;
+        }
+
         private void PushPowerShellAndRunLoop(PowerShell pwsh, PowerShellFrameType frameType, RunspaceInfo newRunspaceInfo = null)
+            => PushPowerShellAndMaybeRunLoop(pwsh, frameType, newRunspaceInfo, skipRunLoop: false);
+
+        private void PushPowerShellAndMaybeRunLoop(
+            PowerShell pwsh,
+            PowerShellFrameType frameType,
+            RunspaceInfo newRunspaceInfo = null,
+            bool skipRunLoop = false)
         {
             // TODO: Improve runspace origin detection here
             if (newRunspaceInfo is null)
@@ -450,7 +660,7 @@ namespace Microsoft.PowerShell.EditorServices.Services.PowerShell.Host
                 }
             }
 
-            PushPowerShellAndRunLoop(new PowerShellContextFrame(pwsh, newRunspaceInfo, frameType));
+            PushPowerShellAndMaybeRunLoop(new PowerShellContextFrame(pwsh, newRunspaceInfo, frameType), skipRunLoop);
         }
 
         private RunspaceInfo GetRunspaceInfoForPowerShell(PowerShell pwsh, out bool isNewRunspace, out RunspaceFrame oldRunspaceFrame)
@@ -475,9 +685,13 @@ namespace Microsoft.PowerShell.EditorServices.Services.PowerShell.Host
             return RunspaceInfo.CreateFromPowerShell(_logger, pwsh, _localComputerName);
         }
 
-        private void PushPowerShellAndRunLoop(PowerShellContextFrame frame)
+        private void PushPowerShellAndMaybeRunLoop(PowerShellContextFrame frame, bool skipRunLoop = false)
         {
             PushPowerShell(frame);
+            if (skipRunLoop)
+            {
+                return;
+            }
 
             try
             {
@@ -485,7 +699,7 @@ namespace Microsoft.PowerShell.EditorServices.Services.PowerShell.Host
                 {
                     RunTopLevelExecutionLoop();
                 }
-                else if ((frame.FrameType & PowerShellFrameType.Debug) != 0)
+                else if (frame.IsDebug)
                 {
                     RunDebugExecutionLoop();
                 }
@@ -496,7 +710,14 @@ namespace Microsoft.PowerShell.EditorServices.Services.PowerShell.Host
             }
             finally
             {
-                PopPowerShell();
+                if (CurrentFrame != frame)
+                {
+                    frame.IsAwaitingPop = true;
+                }
+                else
+                {
+                    PopPowerShell();
+                }
             }
         }
 
@@ -504,6 +725,12 @@ namespace Microsoft.PowerShell.EditorServices.Services.PowerShell.Host
         {
             if (_psFrameStack.Count > 0)
             {
+                if (frame.PowerShell.Runspace == CurrentFrame.PowerShell.Runspace)
+                {
+                    _psFrameStack.Push(frame);
+                    return;
+                }
+
                 RemoveRunspaceEventHandlers(CurrentFrame.PowerShell.Runspace);
             }
 
@@ -512,15 +739,25 @@ namespace Microsoft.PowerShell.EditorServices.Services.PowerShell.Host
             _psFrameStack.Push(frame);
         }
 
+        internal void PopPowerShellForExecution(PowerShellContextFrame expectedFrame)
+        {
+            if (CurrentFrame != expectedFrame)
+            {
+                expectedFrame.IsAwaitingPop = true;
+                return;
+            }
+
+            PopPowerShellImpl();
+        }
+
         private void PopPowerShell(RunspaceChangeAction runspaceChangeAction = RunspaceChangeAction.Exit)
         {
             _shouldExit = false;
-            PowerShellContextFrame frame = _psFrameStack.Pop();
-            try
+            PopPowerShellImpl(_ =>
             {
                 // If we're changing runspace, make sure we move the handlers over. If we just
                 // popped the last frame, then we're exiting and should pop the runspace too.
-                if (_psFrameStack.Count == 0 || CurrentRunspace.Runspace != CurrentPowerShell.Runspace)
+                if (_psFrameStack.Count == 0 || Runspace != CurrentPowerShell.Runspace)
                 {
                     RunspaceFrame previousRunspaceFrame = _runspaceStack.Pop();
                     RemoveRunspaceEventHandlers(previousRunspaceFrame.Runspace);
@@ -539,18 +776,34 @@ namespace Microsoft.PowerShell.EditorServices.Services.PowerShell.Host
                                 newRunspaceFrame.RunspaceInfo));
                     }
                 }
-            }
-            finally
+            });
+        }
+
+        private void PopPowerShellImpl(Action<PowerShellContextFrame> action = null)
+        {
+            do
             {
-                frame.Dispose();
+                PowerShellContextFrame frame = _psFrameStack.Pop();
+                try
+                {
+                    action?.Invoke(frame);
+                }
+                finally
+                {
+                    frame.Dispose();
+                }
             }
+            while (_psFrameStack.Count > 0 && CurrentFrame.IsAwaitingPop);
         }
 
         private void RunTopLevelExecutionLoop()
         {
             try
             {
-                // Make sure we execute any startup tasks first
+                // Make sure we execute any startup tasks first. These should be, in order:
+                // 1. Delegate to register psEditor variable
+                // 2. LoadProfiles delegate
+                // 3. Delegate to import PSEditModule
                 while (_taskQueue.TryTake(out ISynchronousTask task))
                 {
                     task.ExecuteSynchronously(CancellationToken.None);
@@ -559,7 +812,21 @@ namespace Microsoft.PowerShell.EditorServices.Services.PowerShell.Host
                 // Signal that we are ready for outside services to use
                 _started.TrySetResult(true);
 
-                RunExecutionLoop();
+                // While loop is purely so we can recover gracefully from a
+                // terminate exception.
+                while (true)
+                {
+                    try
+                    {
+                        RunExecutionLoop();
+                        break;
+                    }
+                    catch (TerminateException)
+                    {
+                        // Do nothing, since we are at the top level of the loop
+                        // the call stack has been unwound successfully.
+                    }
+                }
             }
             catch (Exception e)
             {
@@ -568,7 +835,7 @@ namespace Microsoft.PowerShell.EditorServices.Services.PowerShell.Host
                 return;
             }
 
-            _logger.LogInformation("PSES pipeline thread loop shutting down");
+            _logger.LogDebug("PSES pipeline thread loop shutting down");
             _stopped.SetResult(true);
         }
 
@@ -577,7 +844,7 @@ namespace Microsoft.PowerShell.EditorServices.Services.PowerShell.Host
             try
             {
                 DebugContext.EnterDebugLoop();
-                RunExecutionLoop();
+                RunExecutionLoop(isForDebug: true);
             }
             finally
             {
@@ -585,18 +852,63 @@ namespace Microsoft.PowerShell.EditorServices.Services.PowerShell.Host
             }
         }
 
-        private void RunExecutionLoop()
+        private void RunExecutionLoop(bool isForDebug = false)
         {
+            Runspace initialRunspace = Runspace;
             while (!ShouldExitExecutionLoop)
             {
-                using CancellationScope cancellationScope = _cancellationContext.EnterScope(isIdleScope: false);
-                DoOneRepl(cancellationScope.CancellationToken);
+                if (isForDebug && !initialRunspace.RunspaceStateInfo.IsUsable())
+                {
+                    return;
+                }
+
+                using CancellationScope cancellationScope = _cancellationContext.EnterScope(false);
+
+                try
+                {
+                    DoOneRepl(cancellationScope.CancellationToken);
+                }
+                catch (OperationCanceledException)
+                {
+                    if (isForDebug)
+                    {
+                        while (Runspace is { RunspaceIsRemote: true } remoteRunspace
+                            && !remoteRunspace.RunspaceStateInfo.IsUsable())
+                        {
+                            PopPowerShell(RunspaceChangeAction.Exit);
+                        }
+
+                        if (ShouldExitExecutionLoop)
+                        {
+                            return;
+                        }
+                    }
+                }
 
                 while (!ShouldExitExecutionLoop
                     && !cancellationScope.CancellationToken.IsCancellationRequested
                     && _taskQueue.TryTake(out ISynchronousTask task))
                 {
-                    task.ExecuteSynchronously(cancellationScope.CancellationToken);
+                    try
+                    {
+                        ExecuteTaskSynchronously(task, cancellationScope.CancellationToken);
+                    }
+                    // Our flaky extension command test seems to be such because sometimes another
+                    // task gets queued, and since it runs in the foreground it cancels that task.
+                    // Interactively, this happens in the first loop (with DoOneRepl) which catches
+                    // the cancellation exception, but when under test that is a no-op, so  it
+                    // happens in this second loop. Hence we need to catch it here too.
+                    catch (OperationCanceledException e)
+                    {
+                        _logger.LogDebug(e, "Task {Task} was canceled!", task);
+                    }
+                }
+
+                if (_shouldExit
+                    && CurrentFrame is { IsRemote: true, IsRepl: true, IsNested: false })
+                {
+                    _shouldExit = false;
+                    PopPowerShell();
                 }
             }
         }
@@ -610,23 +922,29 @@ namespace Microsoft.PowerShell.EditorServices.Services.PowerShell.Host
                 return;
             }
 
+            // TODO: We must remove this awful logic, it causes so much pain. The StopDebugContext()
+            // requires that we're not in a prompt that we're skipping, otherwise the debugger is
+            // "active" but we haven't yet hit a breakpoint.
+            //
+            // When a task must run in the foreground, we cancel out of the idle loop and return to
+            // the top level. At that point, we would normally run a REPL, but we need to
+            // immediately execute the task. So we set _skipNextPrompt to do that.
+            if (_skipNextPrompt)
+            {
+                _skipNextPrompt = false;
+                return;
+            }
+
             // We use the REPL as a poll to check if the debug context is active but PowerShell
             // indicates we're no longer debugging. This happens when PowerShell was used to start
             // the debugger (instead of using a Code launch configuration) via Wait-Debugger or
             // simply hitting a PSBreakpoint. We need to synchronize the state and stop the debug
             // context (and likely the debug server).
-            if (DebugContext.IsActive && !CurrentRunspace.Runspace.Debugger.InBreakpoint)
+            if (!DebugContext.IsDebuggingRemoteRunspace
+                && DebugContext.IsActive
+                && !CurrentRunspace.Runspace.Debugger.InBreakpoint)
             {
                 StopDebugContext();
-            }
-
-            // When a task must run in the foreground, we cancel out of the idle loop and return to the top level.
-            // At that point, we would normally run a REPL, but we need to immediately execute the task.
-            // So we set _skipNextPrompt to do that.
-            if (_skipNextPrompt)
-            {
-                _skipNextPrompt = false;
-                return;
             }
 
             try
@@ -637,26 +955,37 @@ namespace Microsoft.PowerShell.EditorServices.Services.PowerShell.Host
 
                 // If the user input was empty it's because:
                 //  - the user provided no input
-                //  - the readline task was canceled
-                //  - CtrlC was sent to readline (which does not propagate a cancellation)
+                //  - the ReadLine task was canceled
+                //  - CtrlC was sent to ReadLine (which does not propagate a cancellation)
                 //
-                // In any event there's nothing to run in PowerShell, so we just loop back to the prompt again.
-                // However, we must distinguish the last two scenarios, since PSRL will not print a new line in those cases.
+                // In any event there's nothing to run in PowerShell, so we just loop back to the
+                // prompt again. However, PSReadLine will not print a newline for CtrlC, so we print
+                // one, but we do not want to print one if the ReadLine task was canceled.
                 if (string.IsNullOrEmpty(userInput))
                 {
                     if (cancellationToken.IsCancellationRequested || LastKeyWasCtrlC())
                     {
                         UI.WriteLine();
                     }
-                    return;
+                    // Propagate cancellation if that's what happened, since ReadLine won't.
+                    // TODO: We may not need to do this at all.
+                    cancellationToken.ThrowIfCancellationRequested();
+                    return; // Task wasn't canceled but there was no input.
                 }
 
                 InvokeInput(userInput, cancellationToken);
             }
             catch (OperationCanceledException)
             {
-                // Do nothing, since we were just cancelled
+                throw;
             }
+            // Propagate exceptions thrown from the debugger when quitting.
+            catch (TerminateException)
+            {
+                throw;
+            }
+            // Do nothing, a break or continue statement was used outside of a loop.
+            catch (FlowControlException) { }
             catch (Exception e)
             {
                 UI.WriteErrorLine($"An error occurred while running the REPL loop:{Environment.NewLine}{e}");
@@ -673,20 +1002,25 @@ namespace Microsoft.PowerShell.EditorServices.Services.PowerShell.Host
             }
         }
 
-        private string GetPrompt(CancellationToken cancellationToken)
+        internal string GetPrompt(CancellationToken cancellationToken)
         {
+            Runspace.ThrowCancelledIfUnusable();
             string prompt = DefaultPrompt;
             try
             {
                 // TODO: Should we cache PSCommands like this as static members?
-                var command = new PSCommand().AddCommand("prompt");
-                IReadOnlyList<string> results = InvokePSCommand<string>(command, executionOptions: null, cancellationToken);
-                if (results.Count > 0)
+                PSCommand command = new PSCommand().AddCommand("prompt");
+                IReadOnlyList<string> results = InvokePSCommand<string>(
+                    command,
+                    executionOptions: new PowerShellExecutionOptions { ThrowOnError = false },
+                    cancellationToken);
+
+                if (results?.Count > 0)
                 {
                     prompt = results[0];
                 }
             }
-            catch (CommandNotFoundException) { } // Use default prompt
+            catch (RuntimeException) { } // Use default prompt
 
             if (CurrentRunspace.RunspaceOrigin != RunspaceOrigin.Local)
             {
@@ -714,13 +1048,50 @@ namespace Microsoft.PowerShell.EditorServices.Services.PowerShell.Host
 
         private string InvokeReadLine(CancellationToken cancellationToken)
         {
-            return _readLineProvider.ReadLine.ReadLine(cancellationToken);
+            try
+            {
+                // TODO: If we can pass the cancellation token to ReadKey directly in PSReadLine, we
+                // can remove this logic.
+                _readKeyCancellationToken = cancellationToken;
+                cancellationToken.ThrowIfCancellationRequested();
+                return _readLineProvider.ReadLine.ReadLine(cancellationToken);
+            }
+            finally
+            {
+                _readKeyCancellationToken = CancellationToken.None;
+            }
         }
 
+        // TODO: Should we actually be directly invoking input versus queueing it as a task like everything else?
         private void InvokeInput(string input, CancellationToken cancellationToken)
         {
-            var command = new PSCommand().AddScript(input, useLocalScope: false);
-            InvokePSCommand(command, new PowerShellExecutionOptions { AddToHistory = true, ThrowOnError = false, WriteOutputToHost = true }, cancellationToken);
+            SetBusy(true);
+
+            try
+            {
+                // For VS Code's shell integration feature, this replaces their
+                // PSConsoleHostReadLine function wrapper, as that global function is not available
+                // to users of PSES, since we already wrap ReadLine ourselves.
+                if (_shellIntegrationEnabled)
+                {
+                    System.Console.Write("\x1b]633;C\a");
+                }
+
+                InvokePSCommand(
+                    new PSCommand().AddScript(input, useLocalScope: false),
+                    new PowerShellExecutionOptions
+                    {
+                        AddToHistory = true,
+                        ThrowOnError = false,
+                        WriteOutputToHost = true,
+                        FromRepl = true,
+                    },
+                    cancellationToken);
+            }
+            finally
+            {
+                SetBusy(false);
+            }
         }
 
         private void AddRunspaceEventHandlers(Runspace runspace)
@@ -747,14 +1118,14 @@ namespace Microsoft.PowerShell.EditorServices.Services.PowerShell.Host
             // PowerShell.CreateNestedPowerShell() sets IsNested but not IsChild
             // This means it throws due to the parent pipeline not running...
             // So we must use the RunspaceMode.CurrentRunspace option on PowerShell.Create() instead
-            var pwsh = PowerShell.Create(RunspaceMode.CurrentRunspace);
+            PowerShell pwsh = PowerShell.Create(RunspaceMode.CurrentRunspace);
             pwsh.Runspace.ThreadOptions = PSThreadOptions.UseCurrentThread;
             return pwsh;
         }
 
         private static PowerShell CreatePowerShellForRunspace(Runspace runspace)
         {
-            var pwsh = PowerShell.Create();
+            PowerShell pwsh = PowerShell.Create();
             pwsh.Runspace = runspace;
             return pwsh;
         }
@@ -766,7 +1137,7 @@ namespace Microsoft.PowerShell.EditorServices.Services.PowerShell.Host
             Runspace runspace = CreateInitialRunspace(hostStartupInfo.InitialSessionState);
             PowerShell pwsh = CreatePowerShellForRunspace(runspace);
 
-            var engineIntrinsics = (EngineIntrinsics)runspace.SessionStateProxy.GetVariable("ExecutionContext");
+            EngineIntrinsics engineIntrinsics = (EngineIntrinsics)runspace.SessionStateProxy.GetVariable("ExecutionContext");
 
             if (hostStartupInfo.ConsoleReplEnabled)
             {
@@ -778,8 +1149,6 @@ namespace Microsoft.PowerShell.EditorServices.Services.PowerShell.Host
 
                 readLineProvider.OverrideReadLine(readLine);
                 System.Console.CancelKeyPress += OnCancelKeyPress;
-                System.Console.InputEncoding = Encoding.UTF8;
-                System.Console.OutputEncoding = Encoding.UTF8;
             }
 
             if (VersionUtils.IsWindows)
@@ -787,7 +1156,13 @@ namespace Microsoft.PowerShell.EditorServices.Services.PowerShell.Host
                 pwsh.SetCorrectExecutionPolicy(_logger);
             }
 
-            pwsh.ImportModule(CommandsModulePath);
+            string commandsModulePath = Path.Combine(
+                _hostInfo.BundledModulePath,
+                "PowerShellEditorServices",
+                "Commands",
+                "PowerShellEditorServices.Commands.psd1");
+
+            pwsh.ImportModule(commandsModulePath);
 
             if (hostStartupInfo.AdditionalModules?.Count > 0)
             {
@@ -814,7 +1189,8 @@ namespace Microsoft.PowerShell.EditorServices.Services.PowerShell.Host
             return runspace;
         }
 
-        private void OnPowerShellIdle(CancellationToken idleCancellationToken)
+        // NOTE: This token is received from PSReadLine, and it _is_ the ReadKey cancellation token!
+        internal void OnPowerShellIdle(CancellationToken idleCancellationToken)
         {
             IReadOnlyList<PSEventSubscriber> eventSubscribers = _mainRunspaceEngineIntrinsics.Events.Subscribers;
 
@@ -846,21 +1222,18 @@ namespace Microsoft.PowerShell.EditorServices.Services.PowerShell.Host
                 while (!cancellationScope.CancellationToken.IsCancellationRequested
                     && _taskQueue.TryTake(out ISynchronousTask task))
                 {
-                    if (task.ExecutionOptions.MustRunInForeground)
+                    // Tasks which require the foreground cannot run under this idle handler, so the
+                    // current foreground tasks gets canceled, the new task gets prepended, and this
+                    // handler returns.
+                    if (CancelForegroundAndPrepend(task, isIdle: true))
                     {
-                        // If we have a task that is queued, but cannot be run under readline
-                        // we place it back at the front of the queue, and cancel the readline task
-                        _taskQueue.Prepend(task);
-                        _skipNextPrompt = true;
-                        _cancellationContext.CancelIdleParentTask();
                         return;
                     }
 
-                    // If we're executing a task, we don't need to run an extra pipeline later for events
-                    // TODO: This may not be a PowerShell task, so ideally we can differentiate that here.
-                    //       For now it's mostly true and an easy assumption to make.
-                    runPipelineForEventProcessing = false;
-                    task.ExecuteSynchronously(cancellationScope.CancellationToken);
+                    // If we're executing a PowerShell task, we don't need to run an extra pipeline
+                    // later for events.
+                    runPipelineForEventProcessing = task is not ISynchronousPowerShellTask;
+                    ExecuteTaskSynchronously(task, cancellationScope.CancellationToken);
                 }
             }
 
@@ -879,7 +1252,7 @@ namespace Microsoft.PowerShell.EditorServices.Services.PowerShell.Host
             _cancellationContext.CancelCurrentTask();
 
             // If the current task was running under the debugger, we need to synchronize the
-            // cancelation with our debug context (and likely the debug server). Note that if we're
+            // cancellation with our debug context (and likely the debug server). Note that if we're
             // currently stopped in a breakpoint, that means the task is _not_ under the debugger.
             if (!CurrentRunspace.Runspace.Debugger.InBreakpoint)
             {
@@ -889,20 +1262,50 @@ namespace Microsoft.PowerShell.EditorServices.Services.PowerShell.Host
 
         private ConsoleKeyInfo ReadKey(bool intercept)
         {
-            // PSRL doesn't tell us when CtrlC was sent.
-            // So instead we keep track of the last key here.
-            // This isn't functionally required,
-            // but helps us determine when the prompt needs a newline added
+            // NOTE: This requests that the client (the Code extension) send a non-printing key back
+            // to the terminal on stdin, emulating a user pressing a button. This allows
+            // PSReadLine's thread waiting on Console.ReadKey to return. Normally we'd just cancel
+            // this call, but the .NET API ReadKey is not cancellable, and is stuck until we send
+            // input. This leads to a myriad of problems, but we circumvent them by pretending to
+            // press a key, thus allowing ReadKey to return, and us to ignore it.
+            using CancellationTokenRegistration registration = _readKeyCancellationToken.Register(
+                () =>
+                {
+                    // For the regular Extension Terminal, we have an associated language server on
+                    // which we can send a notification, and have the client subscribe an action to
+                    // send a key press.
+                    _languageServer?.SendNotification("powerShell/sendKeyPress");
 
-            _lastKey = ConsoleProxy.SafeReadKey(intercept, CancellationToken.None);
+                    // When temporary Extension Terminals are spawned, there will be no associated
+                    // language server, but instead a debug adaptor server. In this case, the
+                    // notification sent here will come across as a DebugSessionCustomEvent to which
+                    // we can subscribe in the same way.
+                    DebugServer?.SendNotification("powerShell/sendKeyPress");
+                });
+
+            // PSReadLine doesn't tell us when CtrlC was sent. So instead we keep track of the last
+            // key here. This isn't functionally required, but helps us determine when the prompt
+            // needs a newline added
+            //
+            // TODO: We may want to allow users of PSES to override this method call.
+            _lastKey = System.Console.ReadKey(intercept);
             return _lastKey.Value;
         }
 
-        private bool LastKeyWasCtrlC()
+        internal ConsoleKeyInfo ReadKey(bool intercept, CancellationToken cancellationToken)
         {
-            return _lastKey.HasValue
-                && _lastKey.Value.IsCtrlC();
+            try
+            {
+                _readKeyCancellationToken = cancellationToken;
+                return ReadKey(intercept);
+            }
+            finally
+            {
+                _readKeyCancellationToken = CancellationToken.None;
+            }
         }
+
+        private bool LastKeyWasCtrlC() => _lastKey.HasValue && _lastKey.Value.IsCtrlC();
 
         private void StopDebugContext()
         {
@@ -916,35 +1319,91 @@ namespace Microsoft.PowerShell.EditorServices.Services.PowerShell.Host
             }
         }
 
+        private readonly object _replFromAnotherThread = new();
+
+        internal void WaitForExternalDebuggerStops()
+        {
+            lock (_replFromAnotherThread)
+            {
+            }
+        }
+
         private void OnDebuggerStopped(object sender, DebuggerStopEventArgs debuggerStopEventArgs)
         {
+            // If ErrorActionPreference is set to Break, any engine exception is going to trigger a
+            // pipeline stop. Technically this is the same behavior as a standalone PowerShell
+            // process, but we use pipeline stops with greater frequency due to features like run
+            // selection and terminating the debugger. Without this, if the "Stop" button is pressed
+            // then we hit this repeatedly.
+            //
+            // This info is publicly accessible via `PSDebugContext` but we'd need to access it
+            // via a script. At this point in the call I'd prefer this to be as light as possible so
+            // we can escape ASAP but we may want to consider switching to that at some point.
+            if (!Runspace.RunspaceIsRemote && s_scriptDebuggerTriggerObjectProperty is not null)
+            {
+                object triggerObject = null;
+                try
+                {
+                    triggerObject = s_scriptDebuggerTriggerObjectProperty.GetValue(Runspace.Debugger);
+                }
+                catch
+                {
+                    // Ignore all exceptions. There shouldn't be any, but as this is implementation
+                    // detail that is subject to change it's best to be overly cautious.
+                }
+
+                if (triggerObject is PipelineStoppedException pse)
+                {
+                    throw pse;
+                }
+            }
+
             // The debugger has officially started. We use this to later check if we should stop it.
             DebugContext.IsActive = true;
 
-            // If the debug server is NOT active, we need to synchronize state and start it.
-            if (!DebugContext.IsDebugServerActive)
+            // The local debugging architecture works mostly because we control the pipeline thread,
+            // but remote runspaces will trigger debugger stops on a separate thread. We lock here
+            // if we're on a different thread so in then event of a transport error, we can
+            // safely wind down REPL loops in a different thread.
+            bool isExternal = Environment.CurrentManagedThreadId != _pipelineThread.ManagedThreadId;
+            if (!isExternal)
             {
-                _languageServer?.SendNotification("powerShell/startDebugger");
+                OnDebuggerStoppedImpl(sender, debuggerStopEventArgs);
+                return;
             }
 
-            DebugContext.SetDebuggerStopped(debuggerStopEventArgs);
-
-            try
+            lock (_replFromAnotherThread)
             {
-                CurrentPowerShell.WaitForRemoteOutputIfNeeded();
-                PushPowerShellAndRunLoop(CreateNestedPowerShell(CurrentRunspace), PowerShellFrameType.Debug | PowerShellFrameType.Nested);
-                CurrentPowerShell.ResumeRemoteOutputIfNeeded();
+                OnDebuggerStoppedImpl(sender, debuggerStopEventArgs);
             }
-            finally
+
+            void OnDebuggerStoppedImpl(object sender, DebuggerStopEventArgs debuggerStopEventArgs)
             {
-                DebugContext.SetDebuggerResumed();
+                // If the debug server is NOT active, we need to synchronize state and start it.
+                if (!DebugContext.IsDebugServerActive)
+                {
+                    _languageServer?.SendNotification("powerShell/startDebugger");
+                }
+
+                DebugContext.SetDebuggerStopped(debuggerStopEventArgs);
+
+                try
+                {
+                    CurrentPowerShell.WaitForRemoteOutputIfNeeded();
+                    PowerShellFrameType frameBase = CurrentFrame.FrameType & PowerShellFrameType.Remote;
+                    PushPowerShellAndRunLoop(
+                        CreateNestedPowerShell(CurrentRunspace),
+                        frameBase | PowerShellFrameType.Debug | PowerShellFrameType.Nested | PowerShellFrameType.Repl);
+                    CurrentPowerShell.ResumeRemoteOutputIfNeeded();
+                }
+                finally
+                {
+                    DebugContext.SetDebuggerResumed();
+                }
             }
         }
 
-        private void OnBreakpointUpdated(object sender, BreakpointUpdatedEventArgs breakpointUpdatedEventArgs)
-        {
-            DebugContext.HandleBreakpointUpdated(breakpointUpdatedEventArgs);
-        }
+        private void OnBreakpointUpdated(object sender, BreakpointUpdatedEventArgs breakpointUpdatedEventArgs) => DebugContext.HandleBreakpointUpdated(breakpointUpdatedEventArgs);
 
         private void OnRunspaceStateChanged(object sender, RunspaceStateEventArgs runspaceStateEventArgs)
         {
@@ -964,7 +1423,7 @@ namespace Microsoft.PowerShell.EditorServices.Services.PowerShell.Host
             // we simply run this on its thread, guaranteeing that no other action can occur
             return ExecuteDelegateAsync(
                 nameof(PopOrReinitializeRunspaceAsync),
-                new ExecutionOptions { InterruptCurrentForeground = true },
+                new ExecutionOptions { RequiresForeground = true },
                 (_) =>
                 {
                     while (_psFrameStack.Count > 0
@@ -1004,7 +1463,7 @@ namespace Microsoft.PowerShell.EditorServices.Services.PowerShell.Host
             psrlReadLine = null;
             try
             {
-                var psrlProxy = PSReadLineProxy.LoadAndCreate(_loggerFactory, s_bundledModulePath, pwsh);
+                PSReadLineProxy psrlProxy = PSReadLineProxy.LoadAndCreate(_loggerFactory, _hostInfo.BundledModulePath, pwsh);
                 psrlReadLine = new PsrlReadLine(psrlProxy, this, engineIntrinsics, ReadKey, OnPowerShellIdle);
                 return true;
             }

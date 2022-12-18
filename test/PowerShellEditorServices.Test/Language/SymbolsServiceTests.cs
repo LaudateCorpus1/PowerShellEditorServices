@@ -14,6 +14,7 @@ using Microsoft.PowerShell.EditorServices.Services.PowerShell.Host;
 using Microsoft.PowerShell.EditorServices.Services.PowerShell.Utility;
 using Microsoft.PowerShell.EditorServices.Services.Symbols;
 using Microsoft.PowerShell.EditorServices.Services.TextDocument;
+using Microsoft.PowerShell.EditorServices.Test;
 using Microsoft.PowerShell.EditorServices.Test.Shared;
 using Microsoft.PowerShell.EditorServices.Test.Shared.Definition;
 using Microsoft.PowerShell.EditorServices.Test.Shared.Occurrences;
@@ -23,10 +24,10 @@ using Microsoft.PowerShell.EditorServices.Test.Shared.SymbolDetails;
 using Microsoft.PowerShell.EditorServices.Test.Shared.Symbols;
 using Xunit;
 
-namespace Microsoft.PowerShell.EditorServices.Test.Language
+namespace PowerShellEditorServices.Test.Language
 {
     [Trait("Category", "Symbols")]
-    public class SymbolsServiceTests: IDisposable
+    public class SymbolsServiceTests : IDisposable
     {
         private readonly PsesInternalHost psesHost;
         private readonly WorkspaceService workspace;
@@ -46,7 +47,9 @@ namespace Microsoft.PowerShell.EditorServices.Test.Language
 
         public void Dispose()
         {
+#pragma warning disable VSTHRD002
             psesHost.StopAsync().GetAwaiter().GetResult();
+#pragma warning restore VSTHRD002
             CommandHelpers.s_cmdletToAliasCache.Clear();
             CommandHelpers.s_aliasToCmdletCache.Clear();
             GC.SuppressFinalize(this);
@@ -133,7 +136,7 @@ namespace Microsoft.PowerShell.EditorServices.Test.Language
         [Fact]
         public async Task FindsFunctionDefinitionForAlias()
         {
-            // TODO: Eventually we should get the alises through the AST instead of relying on them
+            // TODO: Eventually we should get the aliases through the AST instead of relying on them
             // being defined in the runspace.
             await psesHost.ExecutePSCommandAsync(
                 new PSCommand().AddScript("Set-Alias -Name My-Alias -Value My-Function"),
@@ -149,9 +152,9 @@ namespace Microsoft.PowerShell.EditorServices.Test.Language
         public async Task FindsReferencesOnFunction()
         {
             List<SymbolReference> referencesResult = await GetReferences(FindsReferencesOnFunctionData.SourceDetails).ConfigureAwait(true);
-            Assert.Equal(3, referencesResult.Count);
-            Assert.Equal(1, referencesResult[0].ScriptRegion.StartLineNumber);
-            Assert.Equal(10, referencesResult[0].ScriptRegion.StartColumnNumber);
+            Assert.Equal(2, referencesResult.Count);
+            Assert.Equal(3, referencesResult[0].ScriptRegion.StartLineNumber);
+            Assert.Equal(2, referencesResult[0].ScriptRegion.StartColumnNumber);
         }
 
         [Fact]
@@ -163,9 +166,9 @@ namespace Microsoft.PowerShell.EditorServices.Test.Language
                 CancellationToken.None).ConfigureAwait(true);
 
             List<SymbolReference> referencesResult = await GetReferences(FindsReferencesOnFunctionData.SourceDetails).ConfigureAwait(true);
-            Assert.Equal(4, referencesResult.Count);
-            Assert.Equal(1, referencesResult[0].ScriptRegion.StartLineNumber);
-            Assert.Equal(10, referencesResult[0].ScriptRegion.StartColumnNumber);
+            Assert.Equal(3, referencesResult.Count);
+            Assert.Equal(3, referencesResult[0].ScriptRegion.StartLineNumber);
+            Assert.Equal(2, referencesResult[0].ScriptRegion.StartColumnNumber);
         }
 
         [Fact]
@@ -184,6 +187,7 @@ namespace Microsoft.PowerShell.EditorServices.Test.Language
         public async Task FindsDotSourcedFile()
         {
             SymbolReference definitionResult = await GetDefinition(FindsDotSourcedFileData.SourceDetails).ConfigureAwait(true);
+            Assert.NotNull(definitionResult);
             Assert.True(
                 definitionResult.FilePath.EndsWith(Path.Combine("References", "ReferenceFileE.ps1")),
                 "Unexpected reference file: " + definitionResult.FilePath);
@@ -242,8 +246,8 @@ namespace Microsoft.PowerShell.EditorServices.Test.Language
         {
             List<SymbolReference> referencesResult = await GetReferences(FindsReferencesOnBuiltInCommandWithAliasData.SourceDetails).ConfigureAwait(true);
             Assert.Equal(4, referencesResult.Count);
-            Assert.Equal("gci", referencesResult[1].SymbolName);
-            Assert.Equal("dir", referencesResult[2].SymbolName);
+            Assert.Equal("Get-ChildItem", referencesResult[1].SymbolName);
+            Assert.Equal("Get-ChildItem", referencesResult[2].SymbolName);
             Assert.Equal("Get-ChildItem", referencesResult[referencesResult.Count - 1].SymbolName);
         }
 
@@ -251,14 +255,14 @@ namespace Microsoft.PowerShell.EditorServices.Test.Language
         public async Task FindsReferencesOnFileWithReferencesFileB()
         {
             List<SymbolReference> referencesResult = await GetReferences(FindsReferencesOnFunctionMultiFileDotSourceFileB.SourceDetails).ConfigureAwait(true);
-            Assert.Equal(4, referencesResult.Count);
+            Assert.Equal(3, referencesResult.Count);
         }
 
         [Fact]
         public async Task FindsReferencesOnFileWithReferencesFileC()
         {
             List<SymbolReference> referencesResult = await GetReferences(FindsReferencesOnFunctionMultiFileDotSourceFileC.SourceDetails).ConfigureAwait(true);
-            Assert.Equal(4, referencesResult.Count);
+            Assert.Equal(3, referencesResult.Count);
         }
 
         [Fact]
@@ -310,8 +314,56 @@ namespace Microsoft.PowerShell.EditorServices.Test.Language
         [Fact]
         public void FindsSymbolsInPesterFile()
         {
-            List<SymbolReference> symbolsResult = FindSymbolsInFile(FindSymbolsInPesterFile.SourceDetails);
-            Assert.Equal(5, symbolsResult.Count);
+            List<PesterSymbolReference> symbolsResult = FindSymbolsInFile(FindSymbolsInPesterFile.SourceDetails).OfType<PesterSymbolReference>().ToList();
+            Assert.Equal(12, symbolsResult.Count(r => r.SymbolType == SymbolType.Function));
+
+            Assert.Equal(1, symbolsResult.Count(r => r.Command == PesterCommandType.Describe));
+            SymbolReference firstDescribeSymbol = symbolsResult.First(r => r.Command == PesterCommandType.Describe);
+            Assert.Equal("Describe \"Testing Pester symbols\"", firstDescribeSymbol.SymbolName);
+            Assert.Equal(9, firstDescribeSymbol.ScriptRegion.StartLineNumber);
+            Assert.Equal(1, firstDescribeSymbol.ScriptRegion.StartColumnNumber);
+
+            Assert.Equal(1, symbolsResult.Count(r => r.Command == PesterCommandType.Context));
+            SymbolReference firstContextSymbol = symbolsResult.First(r => r.Command == PesterCommandType.Context);
+            Assert.Equal("Context \"When a Pester file is given\"", firstContextSymbol.SymbolName);
+            Assert.Equal(10, firstContextSymbol.ScriptRegion.StartLineNumber);
+            Assert.Equal(5, firstContextSymbol.ScriptRegion.StartColumnNumber);
+
+            Assert.Equal(4, symbolsResult.Count(r => r.Command == PesterCommandType.It));
+            SymbolReference lastItSymbol = symbolsResult.Last(r => r.Command == PesterCommandType.It);
+            Assert.Equal("It \"Should return setup and teardown symbols\"", lastItSymbol.SymbolName);
+            Assert.Equal(31, lastItSymbol.ScriptRegion.StartLineNumber);
+            Assert.Equal(9, lastItSymbol.ScriptRegion.StartColumnNumber);
+
+            Assert.Equal(1, symbolsResult.Count(r => r.Command == PesterCommandType.BeforeDiscovery));
+            SymbolReference firstBeforeDisocverySymbol = symbolsResult.First(r => r.Command == PesterCommandType.BeforeDiscovery);
+            Assert.Equal("BeforeDiscovery", firstBeforeDisocverySymbol.SymbolName);
+            Assert.Equal(1, firstBeforeDisocverySymbol.ScriptRegion.StartLineNumber);
+            Assert.Equal(1, firstBeforeDisocverySymbol.ScriptRegion.StartColumnNumber);
+
+            Assert.Equal(2, symbolsResult.Count(r => r.Command == PesterCommandType.BeforeAll));
+            SymbolReference lastBeforeAllSymbol = symbolsResult.Last(r => r.Command == PesterCommandType.BeforeAll);
+            Assert.Equal("BeforeAll", lastBeforeAllSymbol.SymbolName);
+            Assert.Equal(11, lastBeforeAllSymbol.ScriptRegion.StartLineNumber);
+            Assert.Equal(9, lastBeforeAllSymbol.ScriptRegion.StartColumnNumber);
+
+            Assert.Equal(1, symbolsResult.Count(r => r.Command == PesterCommandType.BeforeEach));
+            SymbolReference firstBeforeEachSymbol = symbolsResult.First(r => r.Command == PesterCommandType.BeforeEach);
+            Assert.Equal("BeforeEach", firstBeforeEachSymbol.SymbolName);
+            Assert.Equal(15, firstBeforeEachSymbol.ScriptRegion.StartLineNumber);
+            Assert.Equal(9, firstBeforeEachSymbol.ScriptRegion.StartColumnNumber);
+
+            Assert.Equal(1, symbolsResult.Count(r => r.Command == PesterCommandType.AfterEach));
+            SymbolReference firstAfterEachSymbol = symbolsResult.First(r => r.Command == PesterCommandType.AfterEach);
+            Assert.Equal("AfterEach", firstAfterEachSymbol.SymbolName);
+            Assert.Equal(35, firstAfterEachSymbol.ScriptRegion.StartLineNumber);
+            Assert.Equal(9, firstAfterEachSymbol.ScriptRegion.StartColumnNumber);
+
+            Assert.Equal(1, symbolsResult.Count(r => r.Command == PesterCommandType.AfterAll));
+            SymbolReference firstAfterAllSymbol = symbolsResult.First(r => r.Command == PesterCommandType.AfterAll);
+            Assert.Equal("AfterAll", firstAfterAllSymbol.SymbolName);
+            Assert.Equal(40, firstAfterAllSymbol.ScriptRegion.StartLineNumber);
+            Assert.Equal(5, firstAfterAllSymbol.ScriptRegion.StartColumnNumber);
         }
 
         [Fact]

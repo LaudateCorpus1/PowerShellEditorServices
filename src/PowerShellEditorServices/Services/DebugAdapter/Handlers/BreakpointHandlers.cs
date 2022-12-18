@@ -51,7 +51,7 @@ namespace Microsoft.PowerShell.EditorServices.Handlers
             if (!_workspaceService.TryGetFile(request.Source.Path, out ScriptFile scriptFile))
             {
                 string message = _debugStateService.NoDebug ? string.Empty : "Source file could not be accessed, breakpoint not set.";
-                var srcBreakpoints = request.Breakpoints
+                System.Collections.Generic.IEnumerable<Breakpoint> srcBreakpoints = request.Breakpoints
                     .Select(srcBkpt => LspDebugUtils.CreateBreakpoint(
                         srcBkpt, request.Source.Path, message, verified: _debugStateService.NoDebug));
 
@@ -70,7 +70,7 @@ namespace Microsoft.PowerShell.EditorServices.Handlers
 
                 string message = _debugStateService.NoDebug ? string.Empty : "Source is not a PowerShell script, breakpoint not set.";
 
-                var srcBreakpoints = request.Breakpoints
+                System.Collections.Generic.IEnumerable<Breakpoint> srcBreakpoints = request.Breakpoints
                     .Select(srcBkpt => LspDebugUtils.CreateBreakpoint(
                         srcBkpt, request.Source.Path, message, verified: _debugStateService.NoDebug));
 
@@ -128,8 +128,7 @@ namespace Microsoft.PowerShell.EditorServices.Handlers
             CommandBreakpointDetails[] breakpointDetails = request.Breakpoints
                 .Select((funcBreakpoint) => CommandBreakpointDetails.Create(
                     funcBreakpoint.Name,
-                    funcBreakpoint.Condition,
-                    funcBreakpoint.HitCondition))
+                    funcBreakpoint.Condition))
                 .ToArray();
 
             // If this is a "run without debugging (Ctrl+F5)" session ignore requests to set breakpoints.
@@ -147,7 +146,7 @@ namespace Microsoft.PowerShell.EditorServices.Handlers
                 catch (Exception e)
                 {
                     // Log whatever the error is
-                    _logger.LogException($"Caught error while setting command breakpoints", e);
+                    _logger.LogException("Caught error while setting command breakpoints", e);
                 }
                 finally
                 {
@@ -163,8 +162,7 @@ namespace Microsoft.PowerShell.EditorServices.Handlers
             };
         }
 
-        public Task<SetExceptionBreakpointsResponse> Handle(SetExceptionBreakpointsArguments request, CancellationToken cancellationToken)
-        {
+        public Task<SetExceptionBreakpointsResponse> Handle(SetExceptionBreakpointsArguments request, CancellationToken cancellationToken) =>
             // TODO: When support for exception breakpoints (unhandled and/or first chance)
             //       is added to the PowerShell engine, wire up the VSCode exception
             //       breakpoints here using the pattern below to prevent bug regressions.
@@ -187,8 +185,7 @@ namespace Microsoft.PowerShell.EditorServices.Handlers
             //    }
             //}
 
-            return Task.FromResult(new SetExceptionBreakpointsResponse());
-        }
+            Task.FromResult(new SetExceptionBreakpointsResponse());
 
         private bool IsFileSupportedForBreakpoints(string requestedPath, ScriptFile resolvedScriptFile)
         {

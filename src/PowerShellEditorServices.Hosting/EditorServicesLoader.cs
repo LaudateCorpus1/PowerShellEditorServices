@@ -2,7 +2,6 @@
 // Licensed under the MIT License.
 
 using System;
-using System.Diagnostics;
 using System.IO;
 using System.Reflection;
 using System.Threading.Tasks;
@@ -12,6 +11,10 @@ using System.Runtime.InteropServices;
 using SMA = System.Management.Automation;
 using System.Management.Automation;
 using System.Management.Automation.Runspaces;
+
+#if ASSEMBLY_LOAD_STACKTRACE
+using System.Diagnostics;
+#endif
 
 #if CoreCLR
 using System.Runtime.Loader;
@@ -28,9 +31,9 @@ namespace Microsoft.PowerShell.EditorServices.Hosting
     /// </summary>
     public sealed class EditorServicesLoader : IDisposable
     {
-
 #if !CoreCLR
-        private const int Net461Version = 394254;
+        // See https://docs.microsoft.com/en-us/dotnet/framework/migration-guide/how-to-determine-which-versions-are-installed
+        private const int Net462Version = 394802;
 
         private static readonly string s_psesBaseDirPath = Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location);
 #endif
@@ -59,6 +62,7 @@ namespace Microsoft.PowerShell.EditorServices.Hosting
         /// <param name="logger">The host logger to use.</param>
         /// <param name="hostConfig">The host configuration to start editor services with.</param>
         /// <param name="sessionFileWriter">The session file writer to write the session file with.</param>
+        /// <param name="loggersToUnsubscribe">The loggers to unsubscribe form writing to the terminal.</param>
         /// <returns></returns>
         public static EditorServicesLoader Create(
             HostLogger logger,
@@ -80,7 +84,7 @@ namespace Microsoft.PowerShell.EditorServices.Hosting
             // In .NET Core, we add an event here to redirect dependency loading to the new AssemblyLoadContext we load PSES' dependencies into
             logger.Log(PsesLogLevel.Verbose, "Adding AssemblyResolve event handler for new AssemblyLoadContext dependency loading");
 
-            var psesLoadContext = new PsesLoadContext(s_psesDependencyDirPath);
+            PsesLoadContext psesLoadContext = new(s_psesDependencyDirPath);
 
             if (hostConfig.LogLevel == PsesLogLevel.Diagnostic)
             {
@@ -92,9 +96,9 @@ namespace Microsoft.PowerShell.EditorServices.Hosting
                 };
             }
 
-            AssemblyLoadContext.Default.Resolving += (AssemblyLoadContext defaultLoadContext, AssemblyName asmName) =>
+            AssemblyLoadContext.Default.Resolving += (AssemblyLoadContext _, AssemblyName asmName) =>
             {
-#if DEBUG
+#if ASSEMBLY_LOAD_STACKTRACE
                 logger.Log(PsesLogLevel.Diagnostic, $"Assembly resolve event fired for {asmName}. Stacktrace:\n{new StackTrace()}");
 #else
                 logger.Log(PsesLogLevel.Diagnostic, $"Assembly resolve event fired for {asmName}");
@@ -134,14 +138,14 @@ namespace Microsoft.PowerShell.EditorServices.Hosting
             // Unlike in .NET Core, we need to be look for all dependencies in .NET Framework, not just PSES.dll
             AppDomain.CurrentDomain.AssemblyResolve += (object sender, ResolveEventArgs args) =>
             {
-#if DEBUG
+#if ASSEMBLY_LOAD_STACKTRACE
                 logger.Log(PsesLogLevel.Diagnostic, $"Assembly resolve event fired for {args.Name}. Stacktrace:\n{new StackTrace()}");
 #else
                 logger.Log(PsesLogLevel.Diagnostic, $"Assembly resolve event fired for {args.Name}");
 #endif
 
-                var asmName = new AssemblyName(args.Name);
-                var dllName = $"{asmName.Name}.dll";
+                AssemblyName asmName = new(args.Name);
+                string dllName = $"{asmName.Name}.dll";
 
                 // First look for the required assembly in the .NET Framework DLL dir
                 string baseDirAsmPath = Path.Combine(s_psesBaseDirPath, dllName);
@@ -204,6 +208,7 @@ namespace Microsoft.PowerShell.EditorServices.Hosting
 #endif
 
             // Add the bundled modules to the PSModulePath
+            // TODO: Why do we do this in addition to passing the bundled module path to the host?
             UpdatePSModulePath();
 
             // Check to see if the configuration we have is valid
@@ -231,31 +236,27 @@ namespace Microsoft.PowerShell.EditorServices.Hosting
             // This is not high priority, since the PSES process shouldn't be reused
         }
 
-        private static void LoadEditorServices()
-        {
+        private static void LoadEditorServices() =>
             // This must be in its own method, since the actual load happens when the calling method is called
             // The call within this method is therefore a total no-op
             EditorServicesLoading.LoadEditorServicesForHost();
-        }
 
 #if !CoreCLR
         private void CheckNetFxVersion()
         {
-            _logger.Log(PsesLogLevel.Diagnostic, "Checking that .NET Framework version is at least 4.6.1");
-            using (RegistryKey key = Registry.LocalMachine.OpenSubKey(@"SOFTWARE\Microsoft\Net Framework Setup\NDP\v4\Full"))
+            _logger.Log(PsesLogLevel.Diagnostic, "Checking that .NET Framework version is at least 4.6.2");
+            using RegistryKey key = Registry.LocalMachine.OpenSubKey(@"SOFTWARE\Microsoft\Net Framework Setup\NDP\v4\Full");
+            object netFxValue = key?.GetValue("Release");
+            if (netFxValue == null || netFxValue is not int netFxVersion)
             {
-                object netFxValue = key?.GetValue("Release");
-                if (netFxValue == null || !(netFxValue is int netFxVersion))
-                {
-                    return;
-                }
+                return;
+            }
 
-                _logger.Log(PsesLogLevel.Verbose, $".NET registry version: {netFxVersion}");
+            _logger.Log(PsesLogLevel.Verbose, $".NET registry version: {netFxVersion}");
 
-                if (netFxVersion < Net461Version)
-                {
-                    _logger.Log(PsesLogLevel.Warning, $".NET Framework version {netFxVersion} lower than .NET 4.6.1. This runtime is not supported and you may experience errors. Please update your .NET runtime version.");
-                }
+            if (netFxVersion < Net462Version)
+            {
+                _logger.Log(PsesLogLevel.Warning, $".NET Framework version {netFxVersion} lower than .NET 4.6.2. This runtime is not supported and you may experience errors. Please update your .NET runtime version.");
             }
         }
 #endif
@@ -328,10 +329,8 @@ namespace Microsoft.PowerShell.EditorServices.Hosting
 
         private static string GetPSOutputEncoding()
         {
-            using (var pwsh = SMA.PowerShell.Create())
-            {
-                return pwsh.AddScript("$OutputEncoding.EncodingName", useLocalScope: true).Invoke<string>()[0];
-            }
+            using SMA.PowerShell pwsh = SMA.PowerShell.Create();
+            return pwsh.AddScript("$OutputEncoding.EncodingName", useLocalScope: true).Invoke<string>()[0];
         }
 
         private void LogPowerShellDetails()
@@ -355,6 +354,7 @@ namespace Microsoft.PowerShell.EditorServices.Hosting
 ");
         }
 
+        // TODO: Deduplicate this with VersionUtils.
         private static string GetOSArchitecture()
         {
 #if CoreCLR
@@ -408,10 +408,12 @@ namespace Microsoft.PowerShell.EditorServices.Hosting
             // which is expensive.
             // Rather than do that, we instead go straight to the source,
             // which is a static property, internal in WinPS and public in PS 6+
+#pragma warning disable CA1825
             return typeof(PSObject).Assembly
                 .GetType("System.Management.Automation.PSVersionInfo")
                 .GetMethod("get_PSVersion", BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic)
                 .Invoke(null, new object[0] /* Cannot use Array.Empty, since it must work in net452 */);
+#pragma warning restore CA1825
         }
     }
 }

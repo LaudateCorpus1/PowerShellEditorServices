@@ -11,10 +11,12 @@ using System.Management.Automation;
 using System.Management.Automation.Language;
 using System.Runtime.InteropServices;
 using System.Text.RegularExpressions;
+using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
 using Microsoft.PowerShell.EditorServices.CodeLenses;
 using Microsoft.PowerShell.EditorServices.Logging;
+using Microsoft.PowerShell.EditorServices.Services.Configuration;
 using Microsoft.PowerShell.EditorServices.Services.PowerShell;
 using Microsoft.PowerShell.EditorServices.Services.PowerShell.Runspace;
 using Microsoft.PowerShell.EditorServices.Services.PowerShell.Utility;
@@ -39,6 +41,7 @@ namespace Microsoft.PowerShell.EditorServices.Services
 
         private readonly ConcurrentDictionary<string, ICodeLensProvider> _codeLensProviders;
         private readonly ConcurrentDictionary<string, IDocumentSymbolProvider> _documentSymbolProviders;
+        private readonly ConfigurationService _configurationService;
         #endregion
 
         #region Constructors
@@ -63,21 +66,20 @@ namespace Microsoft.PowerShell.EditorServices.Services
             _runspaceContext = runspaceContext;
             _executionService = executionService;
             _workspaceService = workspaceService;
+            _configurationService = configurationService;
 
             _codeLensProviders = new ConcurrentDictionary<string, ICodeLensProvider>();
-            var codeLensProviders = new ICodeLensProvider[]
+            if (configurationService.CurrentSettings.EnableReferencesCodeLens)
             {
-                new ReferencesCodeLensProvider(_workspaceService, this),
-                new PesterCodeLensProvider(configurationService)
-            };
-
-            foreach (ICodeLensProvider codeLensProvider in codeLensProviders)
-            {
-                _codeLensProviders.TryAdd(codeLensProvider.ProviderId, codeLensProvider);
+                ReferencesCodeLensProvider referencesProvider = new(_workspaceService, this);
+                _codeLensProviders.TryAdd(referencesProvider.ProviderId, referencesProvider);
             }
 
+            PesterCodeLensProvider pesterProvider = new(configurationService);
+            _codeLensProviders.TryAdd(pesterProvider.ProviderId, pesterProvider);
+
             _documentSymbolProviders = new ConcurrentDictionary<string, IDocumentSymbolProvider>();
-            var documentSymbolProviders = new IDocumentSymbolProvider[]
+            IDocumentSymbolProvider[] documentSymbolProviders = new IDocumentSymbolProvider[]
             {
                 new ScriptDocumentSymbolProvider(),
                 new PsdDocumentSymbolProvider(),
@@ -91,35 +93,17 @@ namespace Microsoft.PowerShell.EditorServices.Services
 
         #endregion
 
-        public bool TryResgisterCodeLensProvider(ICodeLensProvider codeLensProvider)
-        {
-            return _codeLensProviders.TryAdd(codeLensProvider.ProviderId, codeLensProvider);
-        }
+        public bool TryRegisterCodeLensProvider(ICodeLensProvider codeLensProvider) => _codeLensProviders.TryAdd(codeLensProvider.ProviderId, codeLensProvider);
 
-        public bool DeregisterCodeLensProvider(string providerId)
-        {
-            return _codeLensProviders.TryRemove(providerId, out _);
-        }
+        public bool DeregisterCodeLensProvider(string providerId) => _codeLensProviders.TryRemove(providerId, out _);
 
-        public IEnumerable<ICodeLensProvider> GetCodeLensProviders()
-        {
-            return _codeLensProviders.Values;
-        }
+        public IEnumerable<ICodeLensProvider> GetCodeLensProviders() => _codeLensProviders.Values;
 
-        public bool TryRegisterDocumentSymbolProvider(IDocumentSymbolProvider documentSymbolProvider)
-        {
-            return _documentSymbolProviders.TryAdd(documentSymbolProvider.ProviderId, documentSymbolProvider);
-        }
+        public bool TryRegisterDocumentSymbolProvider(IDocumentSymbolProvider documentSymbolProvider) => _documentSymbolProviders.TryAdd(documentSymbolProvider.ProviderId, documentSymbolProvider);
 
-        public bool DeregisterDocumentSymbolProvider(string providerId)
-        {
-            return _documentSymbolProviders.TryRemove(providerId, out _);
-        }
+        public bool DeregisterDocumentSymbolProvider(string providerId) => _documentSymbolProviders.TryRemove(providerId, out _);
 
-        public IEnumerable<IDocumentSymbolProvider> GetDocumentSymbolProviders()
-        {
-            return _documentSymbolProviders.Values;
-        }
+        public IEnumerable<IDocumentSymbolProvider> GetDocumentSymbolProviders() => _documentSymbolProviders.Values;
 
         /// <summary>
         /// Finds all the symbols in a file.
@@ -130,7 +114,7 @@ namespace Microsoft.PowerShell.EditorServices.Services
         {
             Validate.IsNotNull(nameof(scriptFile), scriptFile);
 
-            var foundOccurrences = new List<SymbolReference>();
+            List<SymbolReference> foundOccurrences = new();
             foreach (IDocumentSymbolProvider symbolProvider in GetDocumentSymbolProviders())
             {
                 foreach (SymbolReference reference in symbolProvider.ProvideDocumentSymbols(scriptFile))
@@ -149,7 +133,7 @@ namespace Microsoft.PowerShell.EditorServices.Services
         /// </summary>
         /// <param name="scriptFile">The details and contents of a open script file</param>
         /// <param name="lineNumber">The line number of the cursor for the given script</param>
-        /// <param name="columnNumber">The coulumn number of the cursor for the given script</param>
+        /// <param name="columnNumber">The column number of the cursor for the given script</param>
         /// <returns>A SymbolReference of the symbol found at the given location
         /// or null if there is no symbol at that location
         /// </returns>
@@ -178,22 +162,36 @@ namespace Microsoft.PowerShell.EditorServices.Services
         /// <param name="foundSymbol">The symbol to find all references for</param>
         /// <param name="referencedFiles">An array of scriptFiles too search for references in</param>
         /// <param name="workspace">The workspace that will be searched for symbols</param>
+        /// <param name="cancellationToken"></param>
         /// <returns>FindReferencesResult</returns>
         public async Task<List<SymbolReference>> FindReferencesOfSymbol(
             SymbolReference foundSymbol,
             ScriptFile[] referencedFiles,
-            WorkspaceService workspace)
+            WorkspaceService workspace,
+            CancellationToken cancellationToken = default)
         {
             if (foundSymbol == null)
             {
                 return null;
             }
 
-            (Dictionary<string, List<string>> cmdletToAliases, Dictionary<string, string> aliasToCmdlets) = await CommandHelpers.GetAliasesAsync(_executionService).ConfigureAwait(false);
+            CommandHelpers.AliasMap aliases = await CommandHelpers.GetAliasesAsync(
+                _executionService,
+                cancellationToken).ConfigureAwait(false);
+
+            string targetName = foundSymbol.SymbolName;
+            if (foundSymbol.SymbolType is SymbolType.Function)
+            {
+                targetName = CommandHelpers.StripModuleQualification(targetName, out _);
+                if (aliases.AliasToCmdlets.TryGetValue(foundSymbol.SymbolName, out string aliasDefinition))
+                {
+                    targetName = aliasDefinition;
+                }
+            }
 
             // We want to look for references first in referenced files, hence we use ordered dictionary
             // TODO: File system case-sensitivity is based on filesystem not OS, but OS is a much cheaper heuristic
-            var fileMap = RuntimeInformation.IsOSPlatform(OSPlatform.Linux)
+            OrderedDictionary fileMap = RuntimeInformation.IsOSPlatform(OSPlatform.Linux)
                 ? new OrderedDictionary()
                 : new OrderedDictionary(StringComparer.OrdinalIgnoreCase);
 
@@ -202,44 +200,62 @@ namespace Microsoft.PowerShell.EditorServices.Services
                 fileMap[scriptFile.FilePath] = scriptFile;
             }
 
-            foreach (string filePath in workspace.EnumeratePSFiles())
+            await ScanWorkspacePSFiles(cancellationToken).ConfigureAwait(false);
+
+            List<SymbolReference> symbolReferences = new();
+
+            // Using a nested method here to get a bit more readability and to avoid roslynator
+            // asserting we should use a giant nested ternary here.
+            static string[] GetIdentifiers(string symbolName, SymbolType symbolType, CommandHelpers.AliasMap aliases)
             {
-                if (!fileMap.Contains(filePath))
+                if (symbolType is not SymbolType.Function)
                 {
-                    if (!workspace.TryGetFile(filePath, out ScriptFile scriptFile))
+                    return new[] { symbolName };
+                }
+
+                if (!aliases.CmdletToAliases.TryGetValue(symbolName, out List<string> foundAliasList))
+                {
+                    return new[] { symbolName };
+                }
+
+                return foundAliasList.Prepend(symbolName)
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .ToArray();
+            }
+
+            string[] allIdentifiers = GetIdentifiers(targetName, foundSymbol.SymbolType, aliases);
+
+            foreach (ScriptFile file in _workspaceService.GetOpenedFiles())
+            {
+                foreach (string targetIdentifier in allIdentifiers)
+                {
+                    if (!file.References.TryGetReferences(targetIdentifier, out ConcurrentBag<IScriptExtent> references))
                     {
-                        // If we can't access the file for some reason, just ignore it
                         continue;
                     }
 
-                    fileMap[filePath] = scriptFile;
-                }
-            }
-
-            var symbolReferences = new List<SymbolReference>();
-            foreach (object fileName in fileMap.Keys)
-            {
-                var file = (ScriptFile)fileMap[fileName];
-
-                IEnumerable<SymbolReference> references = AstOperations.FindReferencesOfSymbol(
-                    file.ScriptAst,
-                    foundSymbol,
-                    cmdletToAliases,
-                    aliasToCmdlets);
-
-                foreach (SymbolReference reference in references)
-                {
-                    try
+                    foreach (IScriptExtent extent in references.OrderBy(e => e.StartOffset))
                     {
-                        reference.SourceLine = file.GetLine(reference.ScriptRegion.StartLineNumber);
+                        SymbolReference reference = new(
+                            SymbolType.Function,
+                            foundSymbol.SymbolName,
+                            extent);
+
+                        try
+                        {
+                            reference.SourceLine = file.GetLine(reference.ScriptRegion.StartLineNumber);
+                        }
+                        catch (ArgumentOutOfRangeException e)
+                        {
+                            reference.SourceLine = string.Empty;
+                            _logger.LogException("Found reference is out of range in script file", e);
+                        }
+                        reference.FilePath = file.FilePath;
+                        symbolReferences.Add(reference);
                     }
-                    catch (ArgumentOutOfRangeException e)
-                    {
-                        reference.SourceLine = string.Empty;
-                        _logger.LogException("Found reference is out of range in script file", e);
-                    }
-                    reference.FilePath = file.FilePath;
-                    symbolReferences.Add(reference);
+
+                    await Task.Yield();
+                    cancellationToken.ThrowIfCancellationRequested();
                 }
             }
 
@@ -247,11 +263,11 @@ namespace Microsoft.PowerShell.EditorServices.Services
         }
 
         /// <summary>
-        /// Finds all the occurences of a symbol in the script given a file location
+        /// Finds all the occurrences of a symbol in the script given a file location
         /// </summary>
         /// <param name="file">The details and contents of a open script file</param>
         /// <param name="symbolLineNumber">The line number of the cursor for the given script</param>
-        /// <param name="symbolColumnNumber">The coulumn number of the cursor for the given script</param>
+        /// <param name="symbolColumnNumber">The column number of the cursor for the given script</param>
         /// <returns>FindOccurrencesResult</returns>
         public static IReadOnlyList<SymbolReference> FindOccurrencesInFile(
             ScriptFile file,
@@ -276,7 +292,7 @@ namespace Microsoft.PowerShell.EditorServices.Services
         /// </summary>
         /// <param name="scriptFile">The details and contents of a open script file</param>
         /// <param name="lineNumber">The line number of the cursor for the given script</param>
-        /// <param name="columnNumber">The coulumn number of the cursor for the given script</param>
+        /// <param name="columnNumber">The column number of the cursor for the given script</param>
         /// <returns>A SymbolReference of the symbol found at the given location
         /// or null if there is no symbol at that location
         /// </returns>
@@ -335,7 +351,7 @@ namespace Microsoft.PowerShell.EditorServices.Services
         /// </summary>
         /// <param name="file">The details and contents of a open script file</param>
         /// <param name="lineNumber">The line number of the cursor for the given script</param>
-        /// <param name="columnNumber">The coulumn number of the cursor for the given script</param>
+        /// <param name="columnNumber">The column number of the cursor for the given script</param>
         /// <returns>ParameterSetSignatures</returns>
         public async Task<ParameterSetSignatures> FindParameterSetsInFileAsync(
             ScriptFile file,
@@ -351,8 +367,8 @@ namespace Microsoft.PowerShell.EditorServices.Services
             // If we are not possibly looking at a Function, we don't
             // need to continue because we won't be able to get the
             // CommandInfo object.
-            if (foundSymbol?.SymbolType != SymbolType.Function
-                && foundSymbol?.SymbolType != SymbolType.Unknown)
+            if (foundSymbol?.SymbolType is not SymbolType.Function
+                and not SymbolType.Unknown)
             {
                 return null;
             }
@@ -423,20 +439,17 @@ namespace Microsoft.PowerShell.EditorServices.Services
                 _workspaceService.ExpandScriptReferences(
                     sourceFile);
 
-            var filesSearched = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            HashSet<string> filesSearched = new(StringComparer.OrdinalIgnoreCase);
 
             // look through the referenced files until definition is found
             // or there are no more file to look through
             SymbolReference foundDefinition = null;
             foreach (ScriptFile scriptFile in referencedFiles)
             {
-                foundDefinition =
-                    AstOperations.FindDefinitionOfSymbol(
-                        scriptFile.ScriptAst,
-                        foundSymbol);
+                foundDefinition = AstOperations.FindDefinitionOfSymbol(scriptFile.ScriptAst, foundSymbol);
 
                 filesSearched.Add(scriptFile.FilePath);
-                if (foundDefinition != null)
+                if (foundDefinition is not null)
                 {
                     foundDefinition.FilePath = scriptFile.FilePath;
                     break;
@@ -456,7 +469,7 @@ namespace Microsoft.PowerShell.EditorServices.Services
 
             // if the definition the not found in referenced files
             // look for it in all the files in the workspace
-            if (foundDefinition == null)
+            if (foundDefinition is null)
             {
                 // Get a list of all powershell files in the workspace path
                 foreach (string file in _workspaceService.EnumeratePSFiles())
@@ -472,7 +485,7 @@ namespace Microsoft.PowerShell.EditorServices.Services
                             foundSymbol);
 
                     filesSearched.Add(file);
-                    if (foundDefinition != null)
+                    if (foundDefinition is not null)
                     {
                         foundDefinition.FilePath = file;
                         break;
@@ -483,7 +496,7 @@ namespace Microsoft.PowerShell.EditorServices.Services
             // if the definition is not found in a file in the workspace
             // look for it in the builtin commands but only if the symbol
             // we are looking at is possibly a Function.
-            if (foundDefinition == null
+            if (foundDefinition is null
                 && (foundSymbol.SymbolType == SymbolType.Function
                     || foundSymbol.SymbolType == SymbolType.Unknown))
             {
@@ -500,6 +513,59 @@ namespace Microsoft.PowerShell.EditorServices.Services
             }
 
             return foundDefinition;
+        }
+
+        private Task _workspaceScanCompleted;
+
+        private async Task ScanWorkspacePSFiles(CancellationToken cancellationToken = default)
+        {
+            if (_configurationService.CurrentSettings.AnalyzeOpenDocumentsOnly)
+            {
+                return;
+            }
+
+            Task scanTask = _workspaceScanCompleted;
+            // It's not impossible for two scans to start at once but it should be exceedingly
+            // unlikely, and shouldn't break anything if it happens to. So we can save some
+            // lock time by accepting that possibility.
+            if (scanTask is null)
+            {
+                scanTask = Task.Run(
+                    () =>
+                    {
+                        foreach (string file in _workspaceService.EnumeratePSFiles())
+                        {
+                            if (_workspaceService.TryGetFile(file, out ScriptFile scriptFile))
+                            {
+                                scriptFile.References.EnsureInitialized();
+                            }
+                        }
+                    },
+                    CancellationToken.None);
+
+                // Ignore the analyzer yelling that we're not awaiting this task, we'll get there.
+#pragma warning disable CS4014
+                Interlocked.CompareExchange(ref _workspaceScanCompleted, scanTask, null);
+#pragma warning restore CS4014
+            }
+
+            // In the simple case where the task is already completed or the token we're given cannot
+            // be cancelled, do a simple await.
+            if (scanTask.IsCompleted || !cancellationToken.CanBeCanceled)
+            {
+                await scanTask.ConfigureAwait(false);
+                return;
+            }
+
+            // If it's not yet done and we can be cancelled, create a new task to represent the
+            // cancellation. That way we can exit a request that relies on the scan without
+            // having to actually stop the work (and then request it again in a few seconds).
+            //
+            // TODO: There's a new API in net6 that lets you await a task with a cancellation token.
+            //       we should #if that in if feasible.
+            TaskCompletionSource<bool> cancelled = new();
+            cancellationToken.Register(() => cancelled.TrySetCanceled());
+            await Task.WhenAny(scanTask, cancelled.Task).ConfigureAwait(false);
         }
 
         /// <summary>
@@ -560,8 +626,8 @@ namespace Microsoft.PowerShell.EditorServices.Services
 
             // find any files where the moduleInfo's path ends with ps1 or psm1
             // and add it to allowed script files
-            if (modPath.EndsWith(@".ps1", StringComparison.OrdinalIgnoreCase) ||
-                modPath.EndsWith(@".psm1", StringComparison.OrdinalIgnoreCase))
+            if (modPath.EndsWith(".ps1", StringComparison.OrdinalIgnoreCase) ||
+                modPath.EndsWith(".psm1", StringComparison.OrdinalIgnoreCase))
             {
                 newFile = _workspaceService.GetFile(modPath);
                 newFile.IsAnalysisEnabled = false;
@@ -573,8 +639,8 @@ namespace Microsoft.PowerShell.EditorServices.Services
                 foreach (PSModuleInfo nestedInfo in moduleInfo.NestedModules)
                 {
                     string nestedModPath = nestedInfo.Path;
-                    if (nestedModPath.EndsWith(@".ps1", StringComparison.OrdinalIgnoreCase) ||
-                        nestedModPath.EndsWith(@".psm1", StringComparison.OrdinalIgnoreCase))
+                    if (nestedModPath.EndsWith(".ps1", StringComparison.OrdinalIgnoreCase) ||
+                        nestedModPath.EndsWith(".psm1", StringComparison.OrdinalIgnoreCase))
                     {
                         newFile = _workspaceService.GetFile(nestedModPath);
                         newFile.IsAnalysisEnabled = false;
@@ -676,6 +742,51 @@ namespace Microsoft.PowerShell.EditorServices.Services
                 true);
 
             return functionDefinitionAst as FunctionDefinitionAst;
+        }
+
+        internal void OnConfigurationUpdated(object _, LanguageServerSettings e)
+        {
+            if (e.AnalyzeOpenDocumentsOnly)
+            {
+                Task scanInProgress = _workspaceScanCompleted;
+                if (scanInProgress is not null)
+                {
+                    // Wait until after the scan completes to close unopened files.
+                    _ = scanInProgress.ContinueWith(_ => CloseUnopenedFiles(), TaskScheduler.Default);
+                }
+                else
+                {
+                    CloseUnopenedFiles();
+                }
+
+                _workspaceScanCompleted = null;
+
+                void CloseUnopenedFiles()
+                {
+                    foreach (ScriptFile scriptFile in _workspaceService.GetOpenedFiles())
+                    {
+                        if (scriptFile.IsOpen)
+                        {
+                            continue;
+                        }
+
+                        _workspaceService.CloseFile(scriptFile);
+                    }
+                }
+            }
+
+            if (e.EnableReferencesCodeLens)
+            {
+                if (_codeLensProviders.ContainsKey(ReferencesCodeLensProvider.Id))
+                {
+                    return;
+                }
+
+                TryRegisterCodeLensProvider(new ReferencesCodeLensProvider(_workspaceService, this));
+                return;
+            }
+
+            DeregisterCodeLensProvider(ReferencesCodeLensProvider.Id);
         }
     }
 }
